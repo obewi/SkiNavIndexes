@@ -1,0 +1,3 @@
+- UV Package Manager
+- Remember: For this project SkiNavIndexes, we will use 'uv' as the Python package manager for dependencies.
+- If you want this persisted beyond this session, let me know and I can record it in memory storage (or a shared config).
