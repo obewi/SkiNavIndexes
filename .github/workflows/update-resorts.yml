@@ -22,13 +22,30 @@ jobs:
 
       - name: Run Overpass query
         run: |
-          curl -X POST \
-            https://overpass-api.de/api/interpreter \
-            -H 'Content-Type: application/x-www-form-urlencoded' \
-            --data-urlencode "data=$(cat queries/winter_sports.overpassql)" \
-            --max-time 600 \
-            -o raw_data.json
-          echo "Downloaded $(wc -c < raw_data.json) bytes"
+          for i in 1 2 3; do
+            echo "Attempt $i..."
+            curl -sS -X POST \
+              https://overpass-api.de/api/interpreter \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode "data=$(cat queries/winter_sports.overpassql)" \
+              --max-time 600 \
+              --retry 3 \
+              --retry-delay 10 \
+              -o raw_data.json && break
+            echo "Retrying in 30s..."
+            sleep 30
+          done
+          
+          # Verify we got valid JSON
+          if ! python -c "import json; json.load(open('raw_data.json'))" 2>/dev/null; then
+            echo "ERROR: Invalid JSON response"
+            cat raw_data.json | head -c 500
+            exit 1
+          fi
+          
+          SIZE=$(wc -c < raw_data.json)
+          ELEMENTS=$(python -c "import json; print(len(json.load(open('raw_data.json')).get('elements', [])))")
+          echo "Downloaded $SIZE bytes with $ELEMENTS elements"
 
       - name: Normalize data
         run: python scripts/normalize.py raw_data.json output/resorts.json
