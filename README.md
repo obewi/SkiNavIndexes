@@ -8,10 +8,10 @@ Automated pipeline that extracts ski resort data from OpenStreetMap, normalizes 
 
 ```bash
 # Get latest version info
-curl -s https://raw.githubusercontent.com/OrbitalExplorer/ski-resort-index/main/latest.json
+curl -s https://raw.githubusercontent.com/OrbitalExplorer/SkiNavIndexes/main/latest.json
 
 # Download resorts.json
-curl -LO $(curl -s https://raw.githubusercontent.com/OrbitalExplorer/ski-resort-index/main/latest.json | jq -r .url)
+curl -LO $(curl -s https://raw.githubusercontent.com/OrbitalExplorer/SkiNavIndexes/main/latest.json | jq -r .url)
 ```
 
 ### Manual Generation
@@ -72,7 +72,7 @@ python scripts/validate.py output/resorts.json
 ## Project Structure
 
 ```
-ski-resort-index/
+SkiNavIndexes/
 ├── .github/workflows/
 │   └── update-resorts.yml    # Monthly cron workflow
 ├── queries/
