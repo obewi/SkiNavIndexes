@@ -481,6 +481,14 @@ def normalize(input_path: str, output_path: str) -> dict:
     linked_count = sum(1 for r in resorts if r.get("site_relation_ids") or r.get("contained_area_ids"))
     print(f"Linked {linked_count} ski areas", file=sys.stderr)
 
+    # Deduplicate: Remove landuse ways that are contained in site=piste relations
+    # Keep only site=piste relations and standalone landuse ways
+    original_count = len(resorts)
+    resorts = [r for r in resorts if not r.get("site_relation_ids")]
+    removed_count = original_count - len(resorts)
+    if removed_count > 0:
+        print(f"Removed {removed_count} landuse ways contained in site=piste relations", file=sys.stderr)
+
     # Clean up internal fields
     for resort in resorts:
         resort.pop("_polygon", None)
