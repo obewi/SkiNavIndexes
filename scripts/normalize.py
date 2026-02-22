@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Normalize Overpass API output into ski resort index format."""
+"""Normalize Overpass API output into ski resort index format.
+
+Flat model: All ski areas are equal, linked via site_relation_ids and contained_area_ids.
+Supports both landuse=winter_sports polygons and site=piste relations.
+"""
 
 import argparse
 import json
@@ -7,9 +11,10 @@ import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from shapely.geometry import Point, Polygon, box, shape
+from shapely.geometry import Point, Polygon, MultiPolygon, box, shape, mapping
+from shapely.ops import unary_union
 from shapely.prepared import prep
 from shapely.validation import make_valid
 
@@ -52,7 +57,7 @@ def collect_name_variants(tags: dict[str, Any]) -> list[str]:
     return deduplicated
 
 
-def geometry_to_polygon(geometry: list[dict]) -> Polygon | None:
+def geometry_to_polygon(geometry: list[dict]) -> Optional[Polygon]:
     """Convert Overpass geometry array to Shapely Polygon."""
     if not geometry or len(geometry) < 3:
         return None
@@ -65,8 +70,11 @@ def geometry_to_polygon(geometry: list[dict]) -> Polygon | None:
         poly = Polygon(coords)
         if not poly.is_valid:
             fixed = make_valid(poly)
-            if hasattr(fixed, "exterior"):
-                poly = Polygon(fixed.exterior.coords)  # type: ignore[union-attr]
+            if isinstance(fixed, (Polygon, MultiPolygon)):
+                if isinstance(fixed, MultiPolygon):
+                    poly = max(fixed.geoms, key=lambda g: g.area)
+                else:
+                    poly = fixed
             else:
                 return None
         if poly.is_empty:
@@ -137,8 +145,8 @@ def apply_padding(
 
 
 def get_country_code(
-    lat: float, lon: float, country_index: list[dict[str, Any]] | None
-) -> str | None:
+    lat: float, lon: float, country_index: Optional[List[Dict[str, Any]]]
+) -> Optional[str]:
     """Get ISO country code from coordinates using polygon containment."""
     if not country_index:
         return None
@@ -163,7 +171,7 @@ def get_country_code(
     return None
 
 
-def build_country_index() -> list[dict[str, Any]] | None:
+def build_country_index() -> Optional[List[Dict[str, Any]]]:
     """Build country polygon index from bundled Natural Earth boundaries."""
     data_path = Path(__file__).parent.parent / "data" / "alps_countries.geojson"
     if not data_path.exists():
@@ -226,86 +234,220 @@ def build_country_index() -> list[dict[str, Any]] | None:
         return None
 
 
-def compute_hierarchy(resorts: list[dict]) -> list[dict]:
-    """Detect parent/child relationships using 95% area containment."""
-    for resort in resorts:
-        resort["parent_id"] = None
-        resort["parent_name"] = None
-        resort["type"] = "resort"
-
-    sorted_resorts = sorted(resorts, key=lambda r: r["area_km2"], reverse=True)
-
-    for i, child in enumerate(sorted_resorts):
-        child_poly = child["_polygon"]
-        child_area = child_poly.area
-
-        for parent in sorted_resorts[:i]:
-            if parent["area_km2"] <= child["area_km2"]:
-                continue
-
-            parent_poly = parent["_polygon"]
-            try:
-                intersection = parent_poly.intersection(child_poly)
-                if intersection.area >= 0.95 * child_area:
-                    child["parent_id"] = parent["id"]
-                    child["parent_name"] = parent["name"]
-                    parent["type"] = "domain"
-                    break
-            except Exception:
-                continue
-
-    return resorts
-
-
 def parse_overpass_output(
-    data: dict, country_index: list[dict[str, Any]] | None
-) -> list[dict]:
-    """Parse Overpass JSON into resort objects."""
+    data: dict, country_index: Optional[List[Dict[str, Any]]]
+) -> Tuple[List[Dict], Dict[int, Polygon]]:
+    """Parse Overpass JSON into resort objects.
+    
+    Returns:
+        tuple: (list of resort dicts, dict mapping relation IDs to their hull polygons)
+    """
     resorts = []
-
+    relation_hulls: dict[int, Polygon] = {}
+    
+    # First pass: collect all elements by type
+    ways_by_id: dict[int, dict] = {}
+    relations_by_id: dict[int, dict] = {}
+    member_geometries: dict[int, list[Polygon]] = {}  # relation_id -> list of member polygons
+    
     for element in data.get("elements", []):
-        tags = element.get("tags", {})
+        if element["type"] == "way":
+            ways_by_id[element["id"]] = element
+        elif element["type"] == "relation":
+            relations_by_id[element["id"]] = element
+    
+    # Process landuse=winter_sports ways
+    for way_id, way in ways_by_id.items():
+        tags = way.get("tags", {})
+        if tags.get("landuse") != "winter_sports":
+            continue
+            
         name = tags.get("name")
         if not name:
             continue
-
-        if element["type"] == "way" and "geometry" in element:
-            polygon = geometry_to_polygon(element["geometry"])
-        elif "bounds" in element:
-            polygon = bounds_to_polygon(element["bounds"])
-        else:
-            continue
-
+        
+        polygon = geometry_to_polygon(way.get("geometry", []))
         if polygon is None or polygon.is_empty:
             continue
-
+        
         area_km2 = calculate_area_km2(polygon)
         bounds = polygon.bounds
         center_lat = polygon.centroid.y
         center_lon = polygon.centroid.x
-
+        
         padding = get_padding_meters(area_km2)
         bbox_center_lat = (bounds[1] + bounds[3]) / 2
         bbox = apply_padding(bounds, padding, bbox_center_lat)
-
+        
         names = collect_name_variants(tags)
         country = get_country_code(center_lat, center_lon, country_index)
+        
+        resorts.append({
+            "id": way_id,
+            "name": name,
+            "names": names,
+            "geometry": mapping(polygon),
+            "bbox": bbox,
+            "area_km2": area_km2,
+            "country": country,
+            "site_relation_ids": [],
+            "_polygon": polygon,
+            "_centroid": polygon.centroid,
+        })
+    
+    # Process site=piste relations
+    for rel_id, relation in relations_by_id.items():
+        tags = relation.get("tags", {})
+        if tags.get("site") != "piste":
+            continue
+            
+        name = tags.get("name")
+        if not name:
+            continue
+        
+        # Collect member way geometries
+        member_polys = []
+        member_way_ids = []
+        
+        for member in relation.get("members", []):
+            if member["type"] == "way":
+                member_way_id = member["ref"]
+                member_way_ids.append(member_way_id)
+                
+                # Look up member way geometry
+                if member_way_id in ways_by_id:
+                    member_way = ways_by_id[member_way_id]
+                    if "geometry" in member_way:
+                        member_poly = geometry_to_polygon(member_way["geometry"])
+                        if member_poly and not member_poly.is_empty:
+                            member_polys.append(member_poly)
+        
+        if not member_polys:
+            # Fall back to bounds if available
+            if "bounds" in relation:
+                hull = bounds_to_polygon(relation["bounds"])
+            else:
+                continue
+        else:
+            # Create convex hull from all member geometries
+            try:
+                union = unary_union(member_polys)
+                hull = union.convex_hull
+            except Exception:
+                continue
+        
+        if hull is None or hull.is_empty:
+            continue
+        
+        relation_hulls[rel_id] = hull
+        
+        area_km2 = calculate_area_km2(hull)
+        bounds = hull.bounds
+        center_lat = hull.centroid.y
+        center_lon = hull.centroid.x
+        
+        padding = get_padding_meters(area_km2)
+        bbox_center_lat = (bounds[1] + bounds[3]) / 2
+        bbox = apply_padding(bounds, padding, bbox_center_lat)
+        
+        names = collect_name_variants(tags)
+        country = get_country_code(center_lat, center_lon, country_index)
+        
+        resorts.append({
+            "id": -rel_id,  # Negative ID to distinguish relations
+            "name": name,
+            "names": names,
+            "geometry": mapping(hull),
+            "bbox": bbox,
+            "area_km2": area_km2,
+            "country": country,
+            "contained_area_ids": [],  # Will be populated in linking step
+            "_polygon": hull,
+            "_is_relation": True,
+            "_member_way_ids": member_way_ids,
+        })
+    
+    # Also process landuse=winter_sports relations (existing behavior)
+    for rel_id, relation in relations_by_id.items():
+        tags = relation.get("tags", {})
+        if tags.get("landuse") != "winter_sports":
+            continue
+            
+        name = tags.get("name")
+        if not name:
+            continue
+        
+        # Use bounds for landuse relations
+        if "bounds" not in relation:
+            continue
+            
+        polygon = bounds_to_polygon(relation["bounds"])
+        if polygon.is_empty:
+            continue
+        
+        area_km2 = calculate_area_km2(polygon)
+        bounds = polygon.bounds
+        center_lat = polygon.centroid.y
+        center_lon = polygon.centroid.x
+        
+        padding = get_padding_meters(area_km2)
+        bbox_center_lat = (bounds[1] + bounds[3]) / 2
+        bbox = apply_padding(bounds, padding, bbox_center_lat)
+        
+        names = collect_name_variants(tags)
+        country = get_country_code(center_lat, center_lon, country_index)
+        
+        resorts.append({
+            "id": -rel_id,
+            "name": name,
+            "names": names,
+            "geometry": None,  # No exact geometry for landuse relations
+            "bbox": bbox,
+            "area_km2": area_km2,
+            "country": country,
+            "site_relation_ids": [],
+            "_polygon": polygon,
+            "_centroid": polygon.centroid,
+        })
+    
+    return resorts, relation_hulls
 
-        resorts.append(
-            {
-                "id": element["id"],
-                "name": name,
-                "names": names,
-                "type": "resort",
-                "parent_id": None,
-                "parent_name": None,
-                "bbox": bbox,
-                "area_km2": area_km2,
-                "country": country,
-                "_polygon": polygon,
-            }
-        )
 
+def link_resorts(resorts: list[dict], relation_hulls: dict[int, Polygon]) -> list[dict]:
+    """Link landuse ways to site=piste relations via spatial overlap."""
+    
+    # Build prepared polygons for relations
+    prepared_hulls = {rel_id: prep(hull) for rel_id, hull in relation_hulls.items()}
+    
+    for resort in resorts:
+        # Skip relations
+        if resort.get("_is_relation"):
+            continue
+        
+        centroid = resort.get("_centroid")
+        if centroid is None:
+            continue
+        
+        # Check which relations contain this resort's centroid
+        for rel_id, prepared in prepared_hulls.items():
+            if prepared.contains(centroid) or prepared.covers(centroid):
+                resort["site_relation_ids"].append(-rel_id)
+    
+    # Populate contained_area_ids for relations
+    resort_by_id = {r["id"]: r for r in resorts}
+    for resort in resorts:
+        if not resort.get("_is_relation"):
+            continue
+        
+        rel_id = -resort["id"]  # Convert back to positive
+        
+        # Find all landuse ways that have this relation in their site_relation_ids
+        for other in resorts:
+            if other.get("_is_relation"):
+                continue
+            if -rel_id in other.get("site_relation_ids", []):
+                resort["contained_area_ids"].append(other["id"])
+    
     return resorts
 
 
@@ -323,18 +465,31 @@ def normalize(input_path: str, output_path: str) -> dict:
     country_index = build_country_index()
 
     print("Parsing elements...", file=sys.stderr)
-    resorts = parse_overpass_output(data, country_index)
-    print(f"Parsed {len(resorts)} valid resorts", file=sys.stderr)
+    resorts, relation_hulls = parse_overpass_output(data, country_index)
+    print(f"Parsed {len(resorts)} valid ski areas", file=sys.stderr)
+    print(f"  - {sum(1 for r in resorts if not r.get('_is_relation'))} landuse ways", file=sys.stderr)
+    print(f"  - {sum(1 for r in resorts if r.get('_is_relation'))} site relations", file=sys.stderr)
 
-    print("Computing hierarchy...", file=sys.stderr)
-    resorts = compute_hierarchy(resorts)
+    print("Linking ski areas...", file=sys.stderr)
+    resorts = link_resorts(resorts, relation_hulls)
+    
+    linked_count = sum(1 for r in resorts if r.get("site_relation_ids") or r.get("contained_area_ids"))
+    print(f"Linked {linked_count} ski areas", file=sys.stderr)
 
-    domains = sum(1 for r in resorts if r["type"] == "domain")
-    with_parent = sum(1 for r in resorts if r["parent_id"] is not None)
-    print(f"Found {domains} domains, {with_parent} child resorts", file=sys.stderr)
-
+    # Clean up internal fields
     for resort in resorts:
-        del resort["_polygon"]
+        resort.pop("_polygon", None)
+        resort.pop("_centroid", None)
+        resort.pop("_is_relation", None)
+        resort.pop("_member_way_ids", None)
+        
+        # Clean up empty lists
+        if resort.get("site_relation_ids") == [] or resort.get("site_relation_ids") is None:
+            resort.pop("site_relation_ids", None)
+        if resort.get("contained_area_ids") == [] or resort.get("contained_area_ids") is None:
+            resort.pop("contained_area_ids", None)
+        if resort.get("geometry") is None:
+            resort.pop("geometry", None)
 
     output = {
         "version": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
@@ -348,7 +503,7 @@ def normalize(input_path: str, output_path: str) -> dict:
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
-    print(f"Wrote {len(resorts)} resorts to {output_path}", file=sys.stderr)
+    print(f"Wrote {len(resorts)} ski areas to {output_path}", file=sys.stderr)
     return output
 
 

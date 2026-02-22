@@ -32,10 +32,11 @@
   "definitions": {
     "resort": {
       "type": "object",
-      "required": ["id", "name", "names", "type", "bbox", "area_km2"],
+      "required": ["id", "name", "names", "bbox", "area_km2"],
       "properties": {
         "id": {
-          "type": "integer"
+          "type": "integer",
+          "description": "OSM ID (positive for ways, negative for relations)"
         },
         "name": {
           "type": "string",
@@ -51,15 +52,17 @@
             "minLength": 1
           }
         },
-        "type": {
-          "type": "string",
-          "enum": ["domain", "resort"]
-        },
-        "parent_id": {
-          "type": ["integer", "null"]
-        },
-        "parent_name": {
-          "type": ["string", "null"]
+        "geometry": {
+          "type": "object",
+          "description": "GeoJSON Polygon geometry (optional, may be null for some entries)",
+          "properties": {
+            "type": {
+              "const": "Polygon"
+            },
+            "coordinates": {
+              "type": "array"
+            }
+          }
         },
         "bbox": {
           "type": "array",
@@ -77,6 +80,20 @@
         "country": {
           "type": ["string", "null"],
           "pattern": "^[A-Z]{2}$"
+        },
+        "site_relation_ids": {
+          "type": "array",
+          "description": "IDs of site=piste relations that contain this area",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "contained_area_ids": {
+          "type": "array",
+          "description": "IDs of landuse=winter_sports areas within this relation",
+          "items": {
+            "type": "integer"
+          }
         }
       }
     }

@@ -26,24 +26,41 @@ def validate_schema(data: dict, schema: dict) -> list[str]:
     return errors
 
 
-def validate_hierarchy(data: dict) -> list[str]:
-    """Ensure parent/child relationships are consistent."""
+def validate_linking(data: dict) -> list[str]:
+    """Ensure linking between relations and areas is consistent."""
     errors = []
     resort_ids = {r["id"] for r in data["resorts"]}
 
     for resort in data["resorts"]:
-        parent_id = resort.get("parent_id")
-        if parent_id is not None and parent_id not in resort_ids:
-            errors.append(
-                f"Resort {resort['id']} ({resort['name']}) has invalid parent_id {parent_id}"
-            )
+        # Validate site_relation_ids
+        site_rel_ids = resort.get("site_relation_ids", [])
+        for rel_id in site_rel_ids:
+            if rel_id not in resort_ids:
+                errors.append(
+                    f"Resort {resort['id']} ({resort['name']}) references non-existent site_relation_id {rel_id}"
+                )
+            else:
+                # Verify the relation has this area in contained_area_ids
+                rel = next((r for r in data["resorts"] if r["id"] == rel_id), None)
+                if rel and resort["id"] not in rel.get("contained_area_ids", []):
+                    errors.append(
+                        f"Relation {rel_id} ({rel['name']}) does not list {resort['id']} ({resort['name']}) in contained_area_ids"
+                    )
 
-        if resort.get("type") == "domain":
-            children = [
-                r for r in data["resorts"] if r.get("parent_id") == resort["id"]
-            ]
-            if not children:
-                pass
+        # Validate contained_area_ids (for relations)
+        contained_ids = resort.get("contained_area_ids", [])
+        for area_id in contained_ids:
+            if area_id not in resort_ids:
+                errors.append(
+                    f"Relation {resort['id']} ({resort['name']}) references non-existent contained_area_id {area_id}"
+                )
+            else:
+                # Verify the area has this relation in site_relation_ids
+                area = next((r for r in data["resorts"] if r["id"] == area_id), None)
+                if area and resort["id"] not in area.get("site_relation_ids", []):
+                    errors.append(
+                        f"Area {area_id} ({area['name']}) does not list {resort['id']} ({resort['name']}) in site_relation_ids"
+                    )
 
     return errors
 
@@ -107,8 +124,8 @@ def validate(input_path: str) -> bool:
     print("Validating schema...", file=sys.stderr)
     all_errors.extend(validate_schema(data, schema))
 
-    print("Validating hierarchy...", file=sys.stderr)
-    all_errors.extend(validate_hierarchy(data))
+    print("Validating linking...", file=sys.stderr)
+    all_errors.extend(validate_linking(data))
 
     print("Validating bboxes...", file=sys.stderr)
     all_errors.extend(validate_bboxes(data))
@@ -124,7 +141,7 @@ def validate(input_path: str) -> bool:
             print(f"  ... and {len(all_errors) - 20} more errors", file=sys.stderr)
         return False
 
-    print(f"\nValidation PASSED for {data['total_resorts']} resorts", file=sys.stderr)
+    print(f"\nValidation PASSED for {data['total_resorts']} ski areas", file=sys.stderr)
     return True
 
 
