@@ -127,8 +127,9 @@ output/
 
 Key files:
 
+- `latest.json` at the repository root is the stable app entrypoint. It is tracked and should point at the current published `resorts.json` release asset.
 - `output/resorts.json` is the backward-compatible discovery index consumed by the current SkiNav app.
-- `output/latest.json` points consumers at the generated dataset version and local artifact root.
+- `output/latest.json` is the generated release-candidate metadata for the build output.
 - `output/build-report.json` records dataset version, generated timestamp, source counts, and warnings.
 - `output/packages/resorts/<id>/...` contains the per-resort files used for richer offline graph and render workflows. Leaf resort packages own render artifacts; domain packages are lightweight metadata packages that reference child resort artifacts instead of duplicating child runs and lifts.
 - `output/groups/<group>.tar.gz` bundles resort packages by group into release-sized archives.
@@ -144,7 +145,7 @@ The 2026-06-03 full cached build produced:
 - `1.6 GB` generated `output/`, down from `5.6 GB` before removing duplicate files and domain payload duplication.
 - `output/local-app/` is about `1.3 GB` when measured by itself. In the combined `output/` tree it adds little extra disk usage on APFS because local-app render files are hard links to package files when supported.
 
-Generated raw and output artifacts are intentionally ignored by Git. Commit source, schemas, code, plans, and workflow files; regenerate artifacts locally.
+Generated raw and output artifacts are intentionally ignored by Git. Commit source, schemas, code, plans, workflow files, and the root `latest.json` entrypoint; regenerate `output/*` locally or in GitHub Actions.
 
 ## Local App Testing
 
@@ -180,9 +181,35 @@ The first-pass local app layout supplies render artifacts and graph metadata onl
 
 ## GitHub Workflow
 
-The repository may include a GitHub Actions workflow as a smoke-check surface for the Rust CLI. Local generation and on-device SkiNav validation remain the primary acceptance path.
+`.github/workflows/release-indexes.yml` is the release automation surface for `obewi/SkiNavIndexes`.
 
-Do not treat the workflow as validated release automation until it has run successfully in GitHub Actions against the intended secrets, permissions, cache behavior, and release strategy.
+Pull requests run Rust smoke checks only: build, tests, and CLI help. Manual dispatch runs the real release path:
+
+1. Resolve the dataset version, defaulting to the current UTC date.
+2. Restore Cargo and `data/raw/openskimap/<dataset-version>/` caches when available.
+3. Fetch missing OpenSkiMap source layers once for that dataset version.
+4. Build and validate the generated output.
+5. Upload generated index and archive artifacts.
+6. Optionally create or update a GitHub release when `publish_release` is enabled.
+
+For a dry run from a pushed branch:
+
+```bash
+gh workflow run release-indexes.yml \
+  --ref feature/geojson-rust-indexes \
+  -f dataset_version=2026-06-03 \
+  -f publish_release=false
+```
+
+For a release:
+
+```bash
+gh workflow run release-indexes.yml \
+  --ref main \
+  -f dataset_version=2026-06-03 \
+  -f publish_release=true \
+  -f release_tag=indexes-2026-06-03
+```
 
 ## Development Checks
 

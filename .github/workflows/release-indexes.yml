@@ -1,0 +1,167 @@
+name: Release SkiNav Indexes
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_version:
+        description: "Dataset version/cache namespace. Defaults to current UTC date."
+        required: false
+        type: string
+      publish_release:
+        description: "Create or update a GitHub release with generated artifacts."
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: "Release tag. Defaults to indexes-<dataset_version>."
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - ".github/workflows/release-indexes.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "README.md"
+
+permissions:
+  contents: write
+
+jobs:
+  smoke:
+    name: Rust smoke checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build CLI
+        run: cargo build --locked
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Check CLI help
+        run: |
+          cargo run --locked -- --help
+          cargo run --locked -- fetch --help
+          cargo run --locked -- build --help
+          cargo run --locked -- validate --help
+          cargo run --locked -- all --help
+
+  release:
+    name: Build release artifacts
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release settings
+        id: settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          dataset_version="${{ inputs.dataset_version }}"
+          if [ -z "$dataset_version" ]; then
+            dataset_version="$(date -u +%F)"
+          fi
+          release_tag="${{ inputs.release_tag }}"
+          if [ -z "$release_tag" ]; then
+            release_tag="indexes-${dataset_version}"
+          fi
+          echo "dataset_version=${dataset_version}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache OpenSkiMap source snapshot
+        uses: actions/cache@v4
+        with:
+          path: data/raw/openskimap/${{ steps.settings.outputs.dataset_version }}
+          key: openskimap-${{ steps.settings.outputs.dataset_version }}
+
+      - name: Build, validate, and package from OpenSkiMap GeoJSON
+        run: |
+          cargo run --release --locked -- all --dataset-version "${{ steps.settings.outputs.dataset_version }}"
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.settings.outputs.dataset_version }}"
+          mkdir -p release/index release/archives
+          cp output/latest.json release/index/latest.json
+          cp output/resorts.json release/index/resorts.json
+          cp output/build-report.json release/index/build-report.json
+          cp output/local-app/manifest.json release/index/local-app-manifest.json
+          tar -czf "release/archives/skinavindexes-local-app-${version}.tar.gz" -C output local-app
+          tar -czf "release/archives/skinavindexes-groups-${version}.tar.gz" -C output groups
+          {
+            echo "# SkiNavIndexes ${version}"
+            echo
+            echo "Generated from OpenSkiMap GeoJSON on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+            echo
+            echo "- Discovery index: resorts.json"
+            echo "- Local app seed: skinavindexes-local-app-${version}.tar.gz"
+            echo "- Group archives: skinavindexes-groups-${version}.tar.gz"
+          } > release/RELEASE_NOTES.md
+
+      - name: Upload generated index artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skinavindexes-index-${{ steps.settings.outputs.dataset_version }}
+          path: release/index
+          if-no-files-found: error
+
+      - name: Upload archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: skinavindexes-archives-${{ steps.settings.outputs.dataset_version }}
+          path: release/archives
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.settings.outputs.release_tag }}"
+          title="SkiNavIndexes ${{ steps.settings.outputs.dataset_version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/index/* release/archives/* --clobber
+            gh release edit "$tag" --title "$title" --notes-file release/RELEASE_NOTES.md --target "$GITHUB_SHA"
+          else
+            gh release create "$tag" release/index/* release/archives/* \
+              --title "$title" \
+              --notes-file release/RELEASE_NOTES.md \
+              --target "$GITHUB_SHA"
+          fi

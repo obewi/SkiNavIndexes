@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
-    io::{BufReader, Read, Write},
+    io::{BufReader, ErrorKind, Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -187,6 +187,58 @@ fn validate_geojson_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn reset_output_dir(output_dir: &Path) -> Result<()> {
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating generated output {}", output_dir.display()))?;
+    for entry in
+        fs::read_dir(output_dir).with_context(|| format!("reading {}", output_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading entry in {}", output_dir.display()))?;
+        remove_generated_path(&entry.path())
+            .with_context(|| format!("removing generated path {}", entry.path().display()))?;
+    }
+    File::create(output_dir.join(".gitkeep"))
+        .with_context(|| format!("creating {}", output_dir.join(".gitkeep").display()))?;
+    Ok(())
+}
+
+fn remove_generated_path(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+
+    if metadata.is_dir() {
+        for _ in 0..5 {
+            for entry in
+                fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
+            {
+                let entry =
+                    entry.with_context(|| format!("reading entry in {}", path.display()))?;
+                remove_generated_path(&entry.path())?;
+            }
+            match fs::remove_dir(path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(66) => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing directory {}", path.display()));
+                }
+            }
+        }
+        fs::remove_dir(path).with_context(|| format!("removing directory {}", path.display()))?;
+        Ok(())
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing file {}", path.display())),
+        }
+    }
+}
+
 fn build_from_cache(
     cache_dir: &Path,
     output_dir: &Path,
@@ -206,7 +258,7 @@ fn build_from_cache(
         }
     }
 
-    fs::create_dir_all(output_dir)?;
+    reset_output_dir(output_dir)?;
     let ski_areas = read_feature_collection(&dataset_dir.join("ski_areas.geojson"))?;
     let runs = read_feature_collection(&dataset_dir.join("runs.geojson"))?;
     let lifts = read_feature_collection(&dataset_dir.join("lifts.geojson"))?;
@@ -572,7 +624,10 @@ fn write_discovery_index(output_dir: &Path, dataset: &NormalizedDataset) -> Resu
     let size = fs::metadata(output_dir.join("resorts.json"))?.len();
     let latest = json!({
         "version": dataset.dataset_version,
-        "url": "https://raw.githubusercontent.com/OrbitalExplorer/SkiNavIndexes/main/output/resorts.json",
+        "url": format!(
+            "https://github.com/obewi/SkiNavIndexes/releases/download/indexes-{}/resorts.json",
+            dataset.dataset_version
+        ),
         "size": size,
         "hash": format!("sha256:{hash}"),
         "localArtifactRoot": "local-app",
