@@ -19,6 +19,9 @@ use walkdir::WalkDir;
 const LAYER_FILES: [&str; 3] = ["ski_areas.geojson", "runs.geojson", "lifts.geojson"];
 const RENDER_SCHEMA_VERSION: i64 = 23;
 const PIPELINE_SCHEMA_VERSION: i64 = 1;
+const RELEASE_PACK_TARGET_BYTES: u64 = 24 * 1024 * 1024;
+const RELEASE_PACK_SMALL_GROUP_BYTES: u64 = 1 * 1024 * 1024;
+const RELEASE_PACK_LARGE_GROUP_BYTES: u64 = 24 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -585,6 +588,7 @@ fn write_outputs(output_dir: &Path, dataset: &NormalizedDataset) -> Result<()> {
     write_discovery_index(output_dir, dataset)?;
     write_resort_packages(output_dir, dataset, &runs_by_resort, &lifts_by_resort)?;
     write_group_archives(output_dir, dataset)?;
+    write_release_packs(output_dir, dataset)?;
     write_local_app_layout(output_dir, dataset)?;
 
     let report = json!({
@@ -888,6 +892,365 @@ fn write_group_archives(output_dir: &Path, dataset: &NormalizedDataset) -> Resul
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleaseResortInput {
+    id: String,
+    estimated_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleaseGroupInput {
+    group_id: String,
+    resorts: Vec<ReleaseResortInput>,
+    estimated_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleasePackGroup {
+    group_id: String,
+    part_index: Option<usize>,
+    part_count: Option<usize>,
+    resort_ids: Vec<String>,
+    estimated_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleasePackPlan {
+    asset_name: String,
+    archive_type: &'static str,
+    groups: Vec<ReleasePackGroup>,
+    estimated_size_bytes: u64,
+}
+
+fn write_release_packs(output_dir: &Path, dataset: &NormalizedDataset) -> Result<()> {
+    let release_dir = output_dir.join("release-packs");
+    fs::create_dir_all(&release_dir)?;
+
+    let group_inputs = release_group_inputs(output_dir, dataset)?;
+    let plans = plan_release_packs(group_inputs);
+    let resort_lookup = dataset
+        .resorts
+        .iter()
+        .map(|resort| (resort.id.as_str(), resort))
+        .collect::<HashMap<_, _>>();
+
+    let mut assets = Vec::new();
+    for plan in &plans {
+        let staging = release_dir.join(format!(
+            ".staging-{}",
+            plan.asset_name.trim_end_matches(".tar.gz")
+        ));
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        fs::create_dir_all(&staging)?;
+
+        let archive_manifest = json!({
+            "schemaVersion": PIPELINE_SCHEMA_VERSION,
+            "datasetVersion": dataset.dataset_version,
+            "generatedAt": dataset.generated_at,
+            "assetName": plan.asset_name,
+            "archiveType": plan.archive_type,
+            "estimatedSizeBytes": plan.estimated_size_bytes,
+            "groups": plan.groups.iter().map(|group| {
+                json!({
+                    "groupId": group.group_id,
+                    "partIndex": group.part_index,
+                    "partCount": group.part_count,
+                    "estimatedSizeBytes": group.estimated_size_bytes,
+                    "resortIds": group.resort_ids,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        write_json_pretty(&staging.join("manifest.json"), &archive_manifest)?;
+
+        for group in &plan.groups {
+            write_release_pack_group(output_dir, &staging, group, &resort_lookup)?;
+        }
+
+        let archive_path = release_dir.join(&plan.asset_name);
+        create_tar_gz(&staging, &archive_path)?;
+        fs::remove_dir_all(&staging)?;
+
+        assets.push(json!({
+            "assetName": plan.asset_name,
+            "archiveType": plan.archive_type,
+            "size": fs::metadata(&archive_path)?.len(),
+            "estimatedSizeBytes": plan.estimated_size_bytes,
+            "hash": format!("sha256:{}", sha256_file(&archive_path)?),
+            "groups": plan.groups.iter().map(|group| {
+                json!({
+                    "groupId": group.group_id,
+                    "partIndex": group.part_index,
+                    "partCount": group.part_count,
+                    "resortCount": group.resort_ids.len(),
+                    "resortIds": group.resort_ids,
+                })
+            }).collect::<Vec<_>>(),
+        }));
+    }
+
+    let manifest = json!({
+        "schemaVersion": PIPELINE_SCHEMA_VERSION,
+        "datasetVersion": dataset.dataset_version,
+        "generatedAt": dataset.generated_at,
+        "strategy": {
+            "targetBytes": RELEASE_PACK_TARGET_BYTES,
+            "smallGroupBytes": RELEASE_PACK_SMALL_GROUP_BYTES,
+            "largeGroupBytes": RELEASE_PACK_LARGE_GROUP_BYTES,
+            "description": "Large logical groups are split by resort package and tiny groups are combined into balanced release packs."
+        },
+        "assetBaseUrl": format!(
+            "https://github.com/obewi/SkiNavIndexes/releases/download/indexes-{}",
+            dataset.dataset_version
+        ),
+        "assetCount": assets.len(),
+        "assets": assets,
+    });
+    write_json_pretty(&release_dir.join("manifest.json"), &manifest)?;
+    Ok(())
+}
+
+fn write_release_pack_group(
+    output_dir: &Path,
+    staging: &Path,
+    group: &ReleasePackGroup,
+    resort_lookup: &HashMap<&str, &ResortRecord>,
+) -> Result<()> {
+    let group_dir = staging.join("groups").join(safe_path_id(&group.group_id));
+    fs::create_dir_all(group_dir.join("resorts"))?;
+    let resorts = group
+        .resort_ids
+        .iter()
+        .map(|resort_id| {
+            resort_lookup
+                .get(resort_id.as_str())
+                .ok_or_else(|| anyhow!("release pack references unknown resort {resort_id}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let group_manifest = json!({
+        "schemaVersion": PIPELINE_SCHEMA_VERSION,
+        "groupId": group.group_id,
+        "partIndex": group.part_index,
+        "partCount": group.part_count,
+        "estimatedSizeBytes": group.estimated_size_bytes,
+        "resorts": resorts.iter().map(|resort| {
+            json!({
+                "id": resort.id,
+                "name": resort.name,
+                "path": format!("resorts/{}/manifest.json", safe_path_id(&resort.id)),
+                "bbox": resort.bbox,
+                "isoCodes": resort.iso_codes,
+                "countryCodes": resort.country_codes,
+                "parentId": resort.parent_id,
+                "childIds": resort.child_ids,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    write_json_pretty(&group_dir.join("manifest.json"), &group_manifest)?;
+
+    for resort in resorts {
+        let source = output_dir
+            .join("packages")
+            .join("resorts")
+            .join(safe_path_id(&resort.id));
+        let target = group_dir.join("resorts").join(safe_path_id(&resort.id));
+        copy_dir_recursive(&source, &target)?;
+    }
+
+    Ok(())
+}
+
+fn release_group_inputs(
+    output_dir: &Path,
+    dataset: &NormalizedDataset,
+) -> Result<Vec<ReleaseGroupInput>> {
+    let mut by_group: BTreeMap<String, Vec<ReleaseResortInput>> = BTreeMap::new();
+    for resort in &dataset.resorts {
+        let package_dir = output_dir
+            .join("packages")
+            .join("resorts")
+            .join(safe_path_id(&resort.id));
+        let estimated_size_bytes = directory_size(&package_dir)
+            .with_context(|| format!("sizing package {}", package_dir.display()))?;
+        by_group
+            .entry(resort.group_id.clone())
+            .or_default()
+            .push(ReleaseResortInput {
+                id: resort.id.clone(),
+                estimated_size_bytes,
+            });
+    }
+
+    Ok(by_group
+        .into_iter()
+        .map(|(group_id, mut resorts)| -> Result<ReleaseGroupInput> {
+            resorts.sort_by(|left, right| left.id.cmp(&right.id));
+            let group_archive = output_dir
+                .join("groups")
+                .join(format!("{}.tar.gz", safe_path_id(&group_id)));
+            let estimated_size_bytes = if group_archive.exists() {
+                fs::metadata(&group_archive)?.len()
+            } else {
+                resorts
+                    .iter()
+                    .map(|resort| resort.estimated_size_bytes)
+                    .sum()
+            };
+            Ok(ReleaseGroupInput {
+                group_id,
+                resorts,
+                estimated_size_bytes,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?)
+}
+
+fn plan_release_packs(groups: Vec<ReleaseGroupInput>) -> Vec<ReleasePackPlan> {
+    let mut packs = Vec::new();
+    let mut small_groups = Vec::new();
+
+    for group in groups {
+        if group.estimated_size_bytes > RELEASE_PACK_LARGE_GROUP_BYTES && group.resorts.len() > 1 {
+            packs.extend(split_large_group(group));
+        } else if group.estimated_size_bytes < RELEASE_PACK_SMALL_GROUP_BYTES {
+            small_groups.push(group);
+        } else {
+            packs.push(single_group_pack(group));
+        }
+    }
+
+    packs.extend(pack_small_groups(small_groups));
+    packs.sort_by(|left, right| left.asset_name.cmp(&right.asset_name));
+    packs
+}
+
+fn single_group_pack(group: ReleaseGroupInput) -> ReleasePackPlan {
+    ReleasePackPlan {
+        asset_name: format!("{}.tar.gz", safe_path_id(&group.group_id)),
+        archive_type: "group",
+        estimated_size_bytes: group.estimated_size_bytes,
+        groups: vec![ReleasePackGroup {
+            group_id: group.group_id,
+            part_index: None,
+            part_count: None,
+            estimated_size_bytes: group.estimated_size_bytes,
+            resort_ids: group.resorts.into_iter().map(|resort| resort.id).collect(),
+        }],
+    }
+}
+
+fn split_large_group(group: ReleaseGroupInput) -> Vec<ReleasePackPlan> {
+    let mut resorts = group.resorts;
+    resorts.sort_by(|left, right| {
+        right
+            .estimated_size_bytes
+            .cmp(&left.estimated_size_bytes)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut parts: Vec<Vec<ReleaseResortInput>> = Vec::new();
+    let mut part_sizes: Vec<u64> = Vec::new();
+    for resort in resorts {
+        let target_index = part_sizes
+            .iter()
+            .enumerate()
+            .find(|(_, size)| **size + resort.estimated_size_bytes <= RELEASE_PACK_TARGET_BYTES)
+            .map(|(index, _)| index);
+        match target_index {
+            Some(index) => {
+                part_sizes[index] += resort.estimated_size_bytes;
+                parts[index].push(resort);
+            }
+            None => {
+                part_sizes.push(resort.estimated_size_bytes);
+                parts.push(vec![resort]);
+            }
+        }
+    }
+
+    let part_count = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut resorts)| {
+            resorts.sort_by(|left, right| left.id.cmp(&right.id));
+            let estimated_size_bytes = resorts
+                .iter()
+                .map(|resort| resort.estimated_size_bytes)
+                .sum();
+            let part_index = index + 1;
+            ReleasePackPlan {
+                asset_name: format!(
+                    "{}.part-{:03}-of-{:03}.tar.gz",
+                    safe_path_id(&group.group_id),
+                    part_index,
+                    part_count
+                ),
+                archive_type: "group-part",
+                estimated_size_bytes,
+                groups: vec![ReleasePackGroup {
+                    group_id: group.group_id.clone(),
+                    part_index: Some(part_index),
+                    part_count: Some(part_count),
+                    estimated_size_bytes,
+                    resort_ids: resorts.into_iter().map(|resort| resort.id).collect(),
+                }],
+            }
+        })
+        .collect()
+}
+
+fn pack_small_groups(mut groups: Vec<ReleaseGroupInput>) -> Vec<ReleasePackPlan> {
+    groups.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+    let mut packs = Vec::new();
+    let mut current_groups = Vec::new();
+    let mut current_size = 0;
+    let mut pack_index = 1;
+
+    for group in groups {
+        if !current_groups.is_empty()
+            && current_size + group.estimated_size_bytes > RELEASE_PACK_TARGET_BYTES
+        {
+            packs.push(small_groups_pack(pack_index, current_groups, current_size));
+            pack_index += 1;
+            current_groups = Vec::new();
+            current_size = 0;
+        }
+        current_size += group.estimated_size_bytes;
+        current_groups.push(group);
+    }
+
+    if !current_groups.is_empty() {
+        packs.push(small_groups_pack(pack_index, current_groups, current_size));
+    }
+
+    packs
+}
+
+fn small_groups_pack(
+    pack_index: usize,
+    groups: Vec<ReleaseGroupInput>,
+    estimated_size_bytes: u64,
+) -> ReleasePackPlan {
+    ReleasePackPlan {
+        asset_name: format!("small-groups-{pack_index:03}.tar.gz"),
+        archive_type: "small-groups",
+        estimated_size_bytes,
+        groups: groups
+            .into_iter()
+            .map(|group| ReleasePackGroup {
+                group_id: group.group_id,
+                part_index: None,
+                part_count: None,
+                estimated_size_bytes: group.estimated_size_bytes,
+                resort_ids: group.resorts.into_iter().map(|resort| resort.id).collect(),
+            })
+            .collect(),
+    }
+}
+
 fn write_local_app_layout(output_dir: &Path, dataset: &NormalizedDataset) -> Result<()> {
     let local_app = output_dir.join("local-app");
     fs::create_dir_all(local_app.join("render-bundles"))?;
@@ -1009,6 +1372,8 @@ fn validate_output(output_dir: &Path) -> Result<()> {
     if !packages.exists() {
         bail!("missing packages/resorts output");
     }
+    let release_pack_manifest = output_dir.join("release-packs").join("manifest.json");
+    validate_geojson_or_json_exists(&release_pack_manifest)?;
 
     for resort in resorts {
         let id = resort
@@ -1900,6 +2265,17 @@ fn checksums_for_dir(path: &Path) -> Result<Value> {
     Ok(Value::Object(files))
 }
 
+fn directory_size(path: &Path) -> Result<u64> {
+    let mut total = 0;
+    for entry in WalkDir::new(path).min_depth(1) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            total += entry.metadata()?.len();
+        }
+    }
+    Ok(total)
+}
+
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
     if target.exists() {
         fs::remove_dir_all(target)?;
@@ -2057,6 +2433,69 @@ mod tests {
                 .exists()
         );
         validate_output(output.path())?;
+        assert!(output.path().join("release-packs/manifest.json").exists());
         Ok(())
+    }
+
+    #[test]
+    fn release_pack_planner_splits_large_groups_and_combines_small_groups() {
+        let groups = vec![
+            ReleaseGroupInput {
+                group_id: "AT-7".to_string(),
+                resorts: vec![
+                    ReleaseResortInput {
+                        id: "large-a".to_string(),
+                        estimated_size_bytes: 18 * 1024 * 1024,
+                    },
+                    ReleaseResortInput {
+                        id: "large-b".to_string(),
+                        estimated_size_bytes: 18 * 1024 * 1024,
+                    },
+                ],
+                estimated_size_bytes: 36 * 1024 * 1024,
+            },
+            ReleaseGroupInput {
+                group_id: "BE-A".to_string(),
+                resorts: vec![ReleaseResortInput {
+                    id: "small-a".to_string(),
+                    estimated_size_bytes: 128 * 1024,
+                }],
+                estimated_size_bytes: 128 * 1024,
+            },
+            ReleaseGroupInput {
+                group_id: "BE-B".to_string(),
+                resorts: vec![ReleaseResortInput {
+                    id: "small-b".to_string(),
+                    estimated_size_bytes: 128 * 1024,
+                }],
+                estimated_size_bytes: 128 * 1024,
+            },
+            ReleaseGroupInput {
+                group_id: "FR-73".to_string(),
+                resorts: vec![ReleaseResortInput {
+                    id: "medium-a".to_string(),
+                    estimated_size_bytes: 2 * 1024 * 1024,
+                }],
+                estimated_size_bytes: 2 * 1024 * 1024,
+            },
+        ];
+
+        let packs = plan_release_packs(groups);
+        let asset_names = packs
+            .iter()
+            .map(|pack| pack.asset_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(asset_names.contains(&"AT-7.part-001-of-002.tar.gz"));
+        assert!(asset_names.contains(&"AT-7.part-002-of-002.tar.gz"));
+        assert!(asset_names.contains(&"FR-73.tar.gz"));
+        assert!(asset_names.contains(&"small-groups-001.tar.gz"));
+
+        let small_pack = packs
+            .iter()
+            .find(|pack| pack.asset_name == "small-groups-001.tar.gz")
+            .expect("small groups pack");
+        assert_eq!(small_pack.archive_type, "small-groups");
+        assert_eq!(small_pack.groups.len(), 2);
     }
 }

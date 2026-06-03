@@ -117,6 +117,9 @@ output/
 │           └── checksums.json
 ├── groups/
 │   └── <group>.tar.gz
+├── release-packs/
+│   ├── manifest.json
+│   └── <balanced-pack>.tar.gz
 └── local-app/
     ├── resorts.json
     ├── latest.json
@@ -132,7 +135,8 @@ Key files:
 - `output/latest.json` is the generated release-candidate metadata for the build output.
 - `output/build-report.json` records dataset version, generated timestamp, source counts, and warnings.
 - `output/packages/resorts/<id>/...` contains the per-resort files used for richer offline graph and render workflows. Leaf resort packages own render artifacts; domain packages are lightweight metadata packages that reference child resort artifacts instead of duplicating child runs and lifts.
-- `output/groups/<group>.tar.gz` bundles resort packages by group into release-sized archives.
+- `output/groups/<group>.tar.gz` bundles resort packages by logical ISO-derived group for debugging and inspection.
+- `output/release-packs/...` is the release distribution layout. Large logical groups are split into part archives and tiny groups are combined into balanced packs. `output/release-packs/manifest.json` maps every release asset back to group and resort IDs.
 - `output/local-app/...` is the local seeding surface for device and simulator validation. It includes `resorts.json`, `latest.json`, `manifest.json`, `render-bundles/<resort-id>/...`, and `graphs/*.graph.meta.json`.
 
 The pipeline intentionally does not generate `rendering_features.geojson`: that file duplicated `downhill_lines.geojson`, `downhill_polygons.geojson`, and `lifts.geojson`, and SkiNav does not consume it. Per-resort raw `runs.geojson` is also omitted because the cached OpenSkiMap source snapshot is the canonical raw input and SkiNav local artifacts do not read package raw-run files.
@@ -189,8 +193,10 @@ Pull requests run Rust smoke checks only: build, tests, and CLI help. Manual dis
 2. Restore Cargo and `data/raw/openskimap/<dataset-version>/` caches when available.
 3. Fetch missing OpenSkiMap source layers once for that dataset version.
 4. Build and validate the generated output.
-5. Upload generated index and archive artifacts.
+5. Upload generated index artifacts and balanced release-pack artifacts.
 6. Optionally create or update a GitHub release when `publish_release` is enabled.
+
+The public release contract is `latest.json`, `resorts.json`, `build-report.json`, `release-pack-manifest.json`, and the tarballs named in that manifest. `output/local-app` is intentionally not uploaded as a release asset; it is a local simulator/device seeding layout and duplicates files already represented in resort packages.
 
 For a dry run from a pushed branch:
 

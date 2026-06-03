@@ -10,6 +10,7 @@
 - Added local-app artifacts for SkiNav simulator/device validation.
 - Updated SkiNav to accept string IDs and DEBUG local artifacts.
 - Added a GitHub Actions release workflow for manual full builds and optional release publication.
+- Added an experimental balanced release-pack layout for testing: oversized groups split into part assets and tiny groups combine into small-group packs.
 - Switched repository URLs from the old owner to `obewi/SkiNavIndexes`.
 - Removed legacy Python/Overpass scripts, requirements, stale schema, tracked generated `output/resorts.json`, and tracked `.DS_Store` files.
 

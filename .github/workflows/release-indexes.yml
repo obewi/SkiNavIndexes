@@ -120,44 +120,16 @@ jobs:
           cp output/latest.json release/index/latest.json
           cp output/resorts.json release/index/resorts.json
           cp output/build-report.json release/index/build-report.json
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-
-          version = os.environ["DATASET_VERSION"]
-          group_dir = Path("output/groups")
-          groups = []
-          for path in sorted(group_dir.glob("*.tar.gz")):
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              groups.append({
-                  "groupId": path.name.removesuffix(".tar.gz"),
-                  "assetName": path.name,
-                  "size": path.stat().st_size,
-                  "hash": f"sha256:{digest}",
-              })
-          manifest = {
-              "version": version,
-              "assetBaseUrl": f"https://github.com/obewi/SkiNavIndexes/releases/download/indexes-{version}",
-              "groupCount": len(groups),
-              "groups": groups,
-          }
-          Path("release/index/group-manifest.json").write_text(
-              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-          )
-          PY
+          cp output/release-packs/manifest.json release/index/release-pack-manifest.json
           {
             echo "# SkiNavIndexes ${version}"
             echo
             echo "Generated from OpenSkiMap GeoJSON on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
             echo
             echo "- Discovery index: resorts.json"
-            echo "- Group archive manifest: group-manifest.json"
-            echo "- Group archives: individual output/groups/<group>.tar.gz release assets"
+            echo "- Release pack manifest: release-pack-manifest.json"
+            echo "- Release packs: balanced output/release-packs/*.tar.gz assets"
           } > release/RELEASE_NOTES.md
-        env:
-          DATASET_VERSION: ${{ steps.settings.outputs.dataset_version }}
 
       - name: Upload generated index artifact
         uses: actions/upload-artifact@v4
@@ -166,11 +138,11 @@ jobs:
           path: release/index
           if-no-files-found: error
 
-      - name: Upload group archive artifacts
+      - name: Upload release pack artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: skinavindexes-groups-${{ steps.settings.outputs.dataset_version }}
-          path: output/groups
+          name: skinavindexes-release-packs-${{ steps.settings.outputs.dataset_version }}
+          path: output/release-packs
           if-no-files-found: error
 
       - name: Publish GitHub release
@@ -184,16 +156,20 @@ jobs:
           title="SkiNavIndexes ${{ steps.settings.outputs.dataset_version }}"
           if gh release view "$tag" >/dev/null 2>&1; then
             for stale_asset in \
+              "group-manifest.json" \
               "local-app-manifest.json" \
               "skinavindexes-groups-${{ steps.settings.outputs.dataset_version }}.tar.gz" \
               "skinavindexes-local-app-${{ steps.settings.outputs.dataset_version }}.tar.gz"
             do
               gh release delete-asset "$tag" "$stale_asset" --yes >/dev/null 2>&1 || true
             done
-            gh release upload "$tag" release/index/* output/groups/*.tar.gz --clobber
+            for stale_group_asset in $(gh release view "$tag" --json assets --jq '.assets[].name | select(test("^(small-groups-|[A-Z0-9]{2}[-_A-Z0-9]*).*\\.tar\\.gz$"))'); do
+              gh release delete-asset "$tag" "$stale_group_asset" --yes >/dev/null 2>&1 || true
+            done
+            gh release upload "$tag" release/index/* output/release-packs/*.tar.gz --clobber
             gh release edit "$tag" --title "$title" --notes-file release/RELEASE_NOTES.md --target "$GITHUB_SHA"
           else
-            gh release create "$tag" release/index/* output/groups/*.tar.gz \
+            gh release create "$tag" release/index/* output/release-packs/*.tar.gz \
               --title "$title" \
               --notes-file release/RELEASE_NOTES.md \
               --target "$GITHUB_SHA"

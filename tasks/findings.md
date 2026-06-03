@@ -16,7 +16,8 @@
 
 - `latest.json` is the stable tracked entrypoint for SkiNav clients.
 - Generated `output/*` is ignored by Git and recreated locally or in GitHub Actions.
-- Release builds should publish `resorts.json`, `latest.json`, build report, local-app archive, and group archives from the workflow output.
+- Release builds should publish `resorts.json`, `latest.json`, build report, release-pack manifest, and the balanced release packs from the workflow output.
+- `output/local-app` should not be published as a release asset. It is a local testing seed and duplicates the render-package data.
 
 ## SkiNav Client
 
