@@ -17,6 +17,9 @@ dist/
 *.egg-info/
 *.egg
 
+# Rust
+target/
+
 # IDEs / editors
 .vscode/
 .idea/
@@ -25,9 +28,16 @@ dist/
 *.sqlite3
 *.db
 
-# Caches
+# Caches / generated source snapshots
 .mypy_cache/
 .pytest_cache/
+data/raw/
+*.part
+raw_data.json
+
+# Generated pipeline output
+output/*
+!output/.gitkeep
 
 # Misc
 .DS_Store

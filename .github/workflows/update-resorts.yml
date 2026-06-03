@@ -1,129 +1,37 @@
-name: Update Ski Resort Index
+name: Rust CLI Smoke Checks
 
 on:
-  schedule:
-    - cron: '0 0 1 * *'
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/update-resorts.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "README.md"
 
 jobs:
-  update:
+  smoke:
+    name: Build and test Rust CLI
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Build CLI
+        run: cargo build --locked
 
-      - name: Run Overpass query
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Check CLI help
         run: |
-          for i in 1 2 3; do
-            echo "Attempt $i..."
-            curl -sS -X POST \
-              https://overpass-api.de/api/interpreter \
-              -H 'Content-Type: application/x-www-form-urlencoded' \
-              --data-urlencode "data=$(cat queries/winter_sports.overpassql)" \
-              --max-time 600 \
-              --retry 3 \
-              --retry-delay 10 \
-              -o raw_data.json && break
-            echo "Retrying in 30s..."
-            sleep 30
-          done
-          
-          # Verify we got valid JSON
-          if ! python -c "import json; json.load(open('raw_data.json'))" 2>/dev/null; then
-            echo "ERROR: Invalid JSON response"
-            cat raw_data.json | head -c 500
-            exit 1
-          fi
-          
-          SIZE=$(wc -c < raw_data.json)
-          ELEMENTS=$(python -c "import json; print(len(json.load(open('raw_data.json')).get('elements', [])))")
-          echo "Downloaded $SIZE bytes with $ELEMENTS elements"
-
-      - name: Normalize data
-        run: python scripts/normalize.py raw_data.json output/resorts.json
-
-      - name: Validate output
-        run: python scripts/validate.py output/resorts.json
-
-      - name: Check for changes
-        id: check
-        run: |
-          VERSION=$(date +%Y-%m-%d)
-          COUNT=$(python -c "import json; print(json.load(open('output/resorts.json'))['total_resorts'])")
-          HASH=$(sha256sum output/resorts.json | cut -d' ' -f1)
-          SIZE=$(wc -c < output/resorts.json | tr -d ' ')
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-          echo "hash=$HASH" >> $GITHUB_OUTPUT
-          echo "size=$SIZE" >> $GITHUB_OUTPUT
-          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
-
-          # Check if different from latest release
-          if gh release view latest --json assets -q '.assets[].name' 2>/dev/null | grep -q resorts.json; then
-            OLD_HASH=$(gh release download latest --pattern resorts.json -O - 2>/dev/null | sha256sum | cut -d' ' -f1 || echo "none")
-            if [ "$HASH" = "$OLD_HASH" ]; then
-              echo "No changes detected"
-              echo "changed=false" >> $GITHUB_OUTPUT
-            else
-              echo "Changes detected"
-              echo "changed=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "No previous release found"
-            echo "changed=true" >> $GITHUB_OUTPUT
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Generate latest.json
-        if: steps.check.outputs.changed == 'true'
-        run: |
-          cat > latest.json << EOF
-          {
-            "version": "${{ steps.check.outputs.version }}",
-            "url": "https://github.com/${{ github.repository }}/releases/download/v${{ steps.check.outputs.version }}/resorts.json",
-            "size": ${{ steps.check.outputs.size }},
-            "hash": "sha256:${{ steps.check.outputs.hash }}"
-          }
-          EOF
-          cat latest.json
-
-      - name: Create Release
-        if: steps.check.outputs.changed == 'true'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ steps.check.outputs.version }}
-          name: Ski Resort Index ${{ steps.check.outputs.version }}
-          files: output/resorts.json
-          body: |
-            ## Automated Monthly Update
-
-            - **Total resorts:** ${{ steps.check.outputs.count }}
-            - **Generated:** ${{ steps.check.outputs.timestamp }}
-            - **SHA256:** ${{ steps.check.outputs.hash }}
-
-            ### Download
-
-            ```bash
-            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ steps.check.outputs.version }}/resorts.json
-            ```
-
-      - name: Commit latest.json
-        if: steps.check.outputs.changed == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add latest.json
-          git commit -m "Update latest.json to v${{ steps.check.outputs.version }}" || echo "No changes to commit"
-          git push
+          cargo run --locked -- --help
+          cargo run --locked -- fetch --help
+          cargo run --locked -- build --help
+          cargo run --locked -- validate --help
+          cargo run --locked -- all --help

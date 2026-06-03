@@ -1,112 +1,201 @@
-# Ski Resort Index
+# SkiNav Indexes
 
-Automated pipeline that extracts ski resort data from OpenStreetMap, normalizes it into a compact JSON format, and publishes it via GitHub Releases with monthly updates.
+Rust CLI for building SkiNav discovery indexes and offline resort artifacts from cached OpenSkiMap GeoJSON snapshots.
 
-## Quick Start
-
-### Download Latest Index
-
-```bash
-# Get latest version info
-curl -s https://raw.githubusercontent.com/OrbitalExplorer/SkiNavIndexes/main/latest.json
-
-# Download resorts.json
-curl -LO $(curl -s https://raw.githubusercontent.com/OrbitalExplorer/SkiNavIndexes/main/latest.json | jq -r .url)
-```
-
-### Manual Generation
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run Overpass query
-curl -X POST https://overpass-api.de/api/interpreter \
-  -H 'Content-Type: application/x-www-form-urlencoded' \
-  --data-urlencode "data=$(cat queries/winter_sports.overpassql)" \
-  -o raw_data.json
-
-# Normalize and validate
-python scripts/normalize.py raw_data.json output/resorts.json
-python scripts/validate.py output/resorts.json
-```
-
-## Output Format
-
-```json
-{
-  "version": "2026-02-01",
-  "generated_at": "2026-02-01T00:00:00Z",
-  "total_resorts": 952,
-  "regions": ["alps"],
-  "resorts": [
-    {
-      "id": 123456,
-      "name": "Val Gardena",
-      "names": ["Val Gardena", "Gröden", "ヴァル・ガルデーナ"],
-      "type": "resort",
-      "parent_id": 789012,
-      "parent_name": "Dolomiti Superski",
-      "bbox": [10.28, 46.51, 11.82, 46.78],
-      "area_km2": 175.3,
-      "country": "IT"
-    }
-  ]
-}
-```
-
-### Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | int | OSM way/relation ID |
-| `name` | string | Primary display name |
-| `names` | string[] | All searchable name variants (multilingual) |
-| `type` | string | `"domain"` (parent) or `"resort"` (leaf) |
-| `parent_id` | int\|null | OSM ID of parent domain |
-| `parent_name` | string\|null | Name of parent domain |
-| `bbox` | number[4] | [west, south, east, north] with padding |
-| `area_km2` | number | Approximate area in km² |
-| `country` | string\|null | ISO 3166-1 alpha-2 code |
-
-## Project Structure
-
-```
-SkiNavIndexes/
-├── .github/workflows/
-│   └── update-resorts.yml    # Monthly cron workflow
-├── queries/
-│   └── winter_sports.overpassql
-├── scripts/
-│   ├── normalize.py          # Overpass → resorts.json
-│   └── validate.py           # Schema validation
-├── schemas/
-│   └── resort.json           # JSON Schema
-├── output/
-│   └── resorts.json          # Generated output
-├── requirements.txt
-└── latest.json               # Version pointer
-```
+The current pipeline is intentionally source-specific: it consumes OpenSkiMap GeoJSON layer files, builds backward-compatible discovery output for SkiNav, and emits richer per-resort packages for local device and simulator testing before any release publishing path is trusted.
 
 ## Data Source
 
-Uses OpenStreetMap `landuse=winter_sports` features with a `name` tag.
+The authoritative upstream inputs are the OpenSkiMap GeoJSON layers at:
 
-**Current coverage:** Alps region (Austria, Switzerland, Italy, France, Germany, Slovenia, Liechtenstein, Croatia edge)
+- `https://tiles.openskimap.org/geojson/lifts.geojson`
+- `https://tiles.openskimap.org/geojson/ski_areas.geojson`
+- `https://tiles.openskimap.org/geojson/runs.geojson`
 
-Country codes are assigned via offline point-in-polygon lookup using bundled Natural Earth boundaries in `data/alps_countries.geojson`.
+The CLI caches these files under `data/raw/openskimap/<dataset-version>/` by default. Treat the cache as the normal development path: fetch once for a dataset version, then rebuild and validate from the local files.
 
-## Automation
+The owner constraint is to avoid repeated upstream downloads. In day-to-day development, use `--skip-fetch` once the day's source files are cached.
 
-GitHub Actions runs monthly on the 1st at 00:00 UTC:
-1. Fetches data from Overpass API
-2. Normalizes and validates
-3. Creates GitHub Release if changes detected
-4. Updates `latest.json`
+The strategy PDF refers to `tiles.skimap.org`; this implementation and these docs use the current CLI default requested for this repository: `https://tiles.openskimap.org/geojson`.
 
-Trigger manually via `workflow_dispatch`.
+## Non-Goals
+
+- No Overpass fallback. If OpenSkiMap is unavailable or missing required fields, the pipeline should fail visibly instead of silently reverting to Overpass.
+- No GeoPackage geometry source for this pass. The pipeline uses the separate GeoJSON layers because they preserve routing and rendering fields needed by SkiNav.
+- No CSV geometry source. CSV snapshots can be useful for audits, but they are not routing or rendering inputs.
+- No on-device Overpass dependency. Local app testing should consume generated files from this repository.
+- No binary `SKIGRAPH` generation in this first pass. `output/local-app/graphs/` contains graph metadata with `status: "not-built"` until the shared SkiNav graph builder contract owns binary graph creation.
+- No one-asset-per-resort release layout. Resort packages are grouped into ISO-derived archives to stay compatible with GitHub release asset limits.
+
+## Commands
+
+Run commands through Cargo during development:
+
+```bash
+cargo run -- <command> [options]
+```
+
+Use release mode for real OpenSkiMap snapshots. The runs layer is roughly 1 GB, and dev-mode builds are only appropriate for CLI smoke checks or tiny fixtures:
+
+```bash
+cargo run --release -- <command> [options]
+```
+
+Installed binary name:
+
+```bash
+skinav-indexes <command> [options]
+```
+
+Available commands:
+
+```bash
+# Download OpenSkiMap GeoJSON layers only when missing from the cache.
+cargo run --release -- fetch
+
+# Build all generated outputs from cached source files.
+cargo run --release -- build
+
+# Validate generated output files.
+cargo run --release -- validate
+
+# Fetch missing sources, build outputs, then validate.
+cargo run --release -- all
+
+# Rebuild and validate from the local cache without any network fetch.
+cargo run --release -- all --skip-fetch
+```
+
+Useful options:
+
+```bash
+# Pin a cache namespace for a specific source snapshot or local test batch.
+cargo run --release -- fetch --dataset-version 2026-06-03
+cargo run --release -- build --dataset-version 2026-06-03
+cargo run --release -- all --dataset-version 2026-06-03 --skip-fetch
+
+# Use non-default directories for isolated experiments.
+cargo run --release -- build --cache-dir data/raw/openskimap --output-dir output
+
+# Point at a compatible OpenSkiMap GeoJSON base URL.
+cargo run --release -- fetch --source-base-url https://tiles.openskimap.org/geojson
+```
+
+## One-Download Cache Policy
+
+The intended workflow is:
+
+1. Run `cargo run --release -- fetch --dataset-version <version>` once for the dataset version.
+2. Re-run `cargo run --release -- build --dataset-version <version>` as often as needed.
+3. Re-run `cargo run --release -- validate` after builds.
+4. Use `cargo run --release -- all --dataset-version <version> --skip-fetch` when you want the full local build and validation path without touching the network.
+
+Do not delete `data/raw/openskimap/<dataset-version>/` just to force a rebuild. Delete or replace cached source files only when intentionally moving to a new upstream snapshot.
+
+## Output Layout
+
+Generated artifacts are written below `output/` by default:
+
+```text
+output/
+├── resorts.json
+├── latest.json
+├── build-report.json
+├── packages/
+│   └── resorts/
+│       └── <resort-id>/
+│           ├── manifest.json
+│           ├── artifact_manifest.json
+│           ├── lifts.geojson
+│           ├── lift_stations.geojson
+│           ├── downhill_lines.geojson
+│           ├── downhill_polygons.geojson
+│           ├── downhill_centerlines.geojson
+│           ├── run_matching_hints.json
+│           ├── explore_detail.json
+│           ├── audit_report.json
+│           └── checksums.json
+├── groups/
+│   └── <group>.tar.gz
+└── local-app/
+    ├── resorts.json
+    ├── latest.json
+    ├── manifest.json
+    ├── graphs/
+    └── render-bundles/
+```
+
+Key files:
+
+- `output/resorts.json` is the backward-compatible discovery index consumed by the current SkiNav app.
+- `output/latest.json` points consumers at the generated dataset version and local artifact root.
+- `output/build-report.json` records dataset version, generated timestamp, source counts, and warnings.
+- `output/packages/resorts/<id>/...` contains the per-resort files used for richer offline graph and render workflows. Leaf resort packages own render artifacts; domain packages are lightweight metadata packages that reference child resort artifacts instead of duplicating child runs and lifts.
+- `output/groups/<group>.tar.gz` bundles resort packages by group into release-sized archives.
+- `output/local-app/...` is the local seeding surface for device and simulator validation. It includes `resorts.json`, `latest.json`, `manifest.json`, `render-bundles/<resort-id>/...`, and `graphs/*.graph.meta.json`.
+
+The pipeline intentionally does not generate `rendering_features.geojson`: that file duplicated `downhill_lines.geojson`, `downhill_polygons.geojson`, and `lifts.geojson`, and SkiNav does not consume it. Per-resort raw `runs.geojson` is also omitted because the cached OpenSkiMap source snapshot is the canonical raw input and SkiNav local artifacts do not read package raw-run files.
+
+The 2026-06-03 full cached build produced:
+
+- `4,494` resorts, including `79` domain records.
+- `96,152` downhill runs and `23,690` lifts from the OpenSkiMap source layers.
+- `627` group archives.
+- `1.6 GB` generated `output/`, down from `5.6 GB` before removing duplicate files and domain payload duplication.
+- `output/local-app/` is about `1.3 GB` when measured by itself. In the combined `output/` tree it adds little extra disk usage on APFS because local-app render files are hard links to package files when supported.
+
+Generated raw and output artifacts are intentionally ignored by Git. Commit source, schemas, code, plans, and workflow files; regenerate artifacts locally.
+
+## Local App Testing
+
+Local/on-device validation comes before GitHub Actions or release publishing.
+
+1. Fetch once for the dataset version:
+
+   ```bash
+   cargo run --release -- fetch --dataset-version 2026-06-03
+   ```
+
+2. Rebuild and validate from cache:
+
+   ```bash
+   cargo run --release -- all --dataset-version 2026-06-03 --skip-fetch
+   ```
+
+3. Seed SkiNav from `output/local-app/`.
+
+   The generated local app directory mirrors the SkiNav document layout used for offline testing:
+
+   ```text
+   output/local-app/resorts.json
+   output/local-app/latest.json
+   output/local-app/manifest.json
+   output/local-app/graphs/
+   output/local-app/render-bundles/
+   ```
+
+4. Run SkiNav against those local files on the simulator or device and inspect routing/rendering behavior before considering any release publication.
+
+The first-pass local app layout supplies render artifacts and graph metadata only. `output/local-app/manifest.json` has `containsBinaryGraphs: false`; binary graph generation is deferred to the shared SkiNav graph builder contract.
+
+## GitHub Workflow
+
+The repository may include a GitHub Actions workflow as a smoke-check surface for the Rust CLI. Local generation and on-device SkiNav validation remain the primary acceptance path.
+
+Do not treat the workflow as validated release automation until it has run successfully in GitHub Actions against the intended secrets, permissions, cache behavior, and release strategy.
+
+## Development Checks
+
+Lightweight checks that do not download GeoJSON:
+
+```bash
+cargo test
+cargo run -- --help
+cargo run --release -- all --skip-fetch
+```
+
+`cargo run --release -- all --skip-fetch` requires cached source files to already exist for the selected dataset version.
 
 ## License
 
-Data sourced from OpenStreetMap, licensed under ODbL.
-Country boundary reference data is derived from Natural Earth.
+OpenSkiMap combines OpenStreetMap and Skimap.org data. Preserve upstream attribution and license requirements when publishing derived artifacts.

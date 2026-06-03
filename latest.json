@@ -1,6 +1,7 @@
 {
-  "version": "2026-05-01",
-  "url": "https://github.com/obewi/SkiNavIndexes/releases/download/v2026-05-01/resorts.json",
-  "size": 335281,
-  "hash": "sha256:8aee66e242a86dbb1ccea3612ca6f9d6dc94760b60796b74afee33479ab17a26"
+  "version": "2026-06-03",
+  "url": "https://raw.githubusercontent.com/OrbitalExplorer/SkiNavIndexes/main/output/resorts.json",
+  "size": 2306413,
+  "hash": "sha256:9b2f6318850a9fd4fb775d03f939a23b38ca4d5580843e87e8cecb6411f3fcaf",
+  "localArtifactRoot": "local-app"
 }

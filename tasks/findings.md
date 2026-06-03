@@ -1,5 +1,29 @@
 # Findings: Ski Resort Index Pipeline
 
+## 2026-06-03 - OpenSkiMap GeoJSON Rebuild Decisions
+
+### Authoritative Inputs
+- `/Users/eli/Downloads/GeoJSON Integration Strategy.pdf`
+- User direction on 2026-06-03: use Rust, update docs after implementation, and treat old project docs as outdated.
+
+### Locked Decisions
+- OpenSkiMap GeoJSON layer files are authoritative for this migration:
+  - `ski_areas.geojson`
+  - `runs.geojson`
+  - `lifts.geojson`
+- GeoPackage is explicitly not the target for this pass because the strategy document says it omits routing-critical fields such as `runConvention`.
+- The legacy Overpass pipeline is superseded and should not be retained as a fallback for the new artifact publisher.
+- Local iteration must use a cached raw-source directory so OpenSkiMap is not downloaded repeatedly.
+- GitHub Actions publishing is not the first validation path. The first validation path is local generation plus SkiNav on-device/simulator consumption.
+- Rust is the durable pipeline language for speed, memory control, strict schemas, reproducible CLI builds, and long-term artifact generation.
+
+### Compatibility Constraint
+- Current SkiNav only consumes SkiNavIndexes through `latest.json` and `resorts.json`.
+- Rich artifacts are currently local app files under `Documents/graphs` and `Documents/render-bundles`.
+- The rebuild therefore needs both:
+  - backward-compatible discovery output, and
+  - a local artifact installation/testing path for SkiNav before release publishing.
+
 ## Key Decisions
 
 ### Data Source
