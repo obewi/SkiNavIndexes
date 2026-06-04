@@ -1,19 +1,12 @@
 name: Release SkiNav Indexes
 
 on:
+  schedule:
+    - cron: "0 0 1 * *"
   workflow_dispatch:
     inputs:
       dataset_version:
-        description: "Dataset version/cache namespace. Defaults to current UTC date."
-        required: false
-        type: string
-      publish_release:
-        description: "Create or update a GitHub release with generated artifacts."
-        required: true
-        default: false
-        type: boolean
-      release_tag:
-        description: "Release tag. Defaults to indexes-<dataset_version>."
+        description: "Dataset version. Defaults to current UTC date."
         required: false
         type: string
   pull_request:
@@ -25,7 +18,7 @@ on:
       - "README.md"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   smoke:
@@ -39,15 +32,6 @@ jobs:
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build CLI
         run: cargo build --locked
@@ -63,11 +47,19 @@ jobs:
           cargo run --locked -- validate --help
           cargo run --locked -- all --help
 
-  release:
-    name: Build release artifacts
+      - name: Delete generated runner data
+        if: always()
+        shell: bash
+        run: |
+          rm -rf target output data/raw/openskimap
+
+  update:
+    name: Update SkiNav indexes
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request'
     timeout-minutes: 120
+    permissions:
+      contents: write
 
     steps:
       - name: Check out repository
@@ -82,34 +74,30 @@ jobs:
           if [ -z "$dataset_version" ]; then
             dataset_version="$(date -u +%F)"
           fi
-          release_tag="${{ inputs.release_tag }}"
-          if [ -z "$release_tag" ]; then
-            release_tag="indexes-${dataset_version}"
-          fi
           echo "dataset_version=${dataset_version}" >> "$GITHUB_OUTPUT"
-          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=indexes-${dataset_version}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache OpenSkiMap source snapshot
-        uses: actions/cache@v4
-        with:
-          path: data/raw/openskimap/${{ steps.settings.outputs.dataset_version }}
-          key: openskimap-${{ steps.settings.outputs.dataset_version }}
-
       - name: Build, validate, and package from OpenSkiMap GeoJSON
         run: |
           cargo run --release --locked -- all --dataset-version "${{ steps.settings.outputs.dataset_version }}"
+
+      - name: Collect release metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          hash="$(sha256sum output/resorts.json | cut -d' ' -f1)"
+          size="$(wc -c < output/resorts.json | tr -d ' ')"
+          count="$(python -c 'import json; print(json.load(open("output/resorts.json"))["total_resorts"])')"
+          timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          echo "hash=${hash}" >> "$GITHUB_OUTPUT"
+          echo "size=${size}" >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "timestamp=${timestamp}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release assets
         shell: bash
@@ -126,27 +114,14 @@ jobs:
             echo
             echo "Generated from OpenSkiMap GeoJSON on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
             echo
+            echo "- Total resorts: ${{ steps.metadata.outputs.count }}"
+            echo "- SHA256: ${{ steps.metadata.outputs.hash }}"
             echo "- Discovery index: resorts.json"
             echo "- Release pack manifest: release-pack-manifest.json"
             echo "- Release packs: balanced output/release-packs/*.tar.gz assets"
           } > release/RELEASE_NOTES.md
 
-      - name: Upload generated index artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: skinavindexes-index-${{ steps.settings.outputs.dataset_version }}
-          path: release/index
-          if-no-files-found: error
-
-      - name: Upload release pack artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: skinavindexes-release-packs-${{ steps.settings.outputs.dataset_version }}
-          path: output/release-packs
-          if-no-files-found: error
-
       - name: Publish GitHub release
-        if: inputs.publish_release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -176,7 +151,7 @@ jobs:
           fi
 
       - name: Update root latest.json entrypoint
-        if: inputs.publish_release && github.ref_name == github.event.repository.default_branch
+        if: github.ref_name == github.event.repository.default_branch
         shell: bash
         run: |
           set -euo pipefail
@@ -190,3 +165,9 @@ jobs:
           git add latest.json
           git commit -m "Update latest.json for ${{ steps.settings.outputs.dataset_version }}"
           git push origin HEAD:${{ github.event.repository.default_branch }}
+
+      - name: Delete generated runner data
+        if: always()
+        shell: bash
+        run: |
+          rm -rf release output data/raw/openskimap target
