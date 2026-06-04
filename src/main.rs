@@ -17,11 +17,17 @@ use tar::Builder;
 use walkdir::WalkDir;
 
 const LAYER_FILES: [&str; 3] = ["ski_areas.geojson", "runs.geojson", "lifts.geojson"];
+const CONNECTIONS_FILE: &str = "connections.geojson";
 const RENDER_SCHEMA_VERSION: i64 = 23;
 const PIPELINE_SCHEMA_VERSION: i64 = 1;
 const RELEASE_PACK_TARGET_BYTES: u64 = 24 * 1024 * 1024;
 const RELEASE_PACK_SMALL_GROUP_BYTES: u64 = 1 * 1024 * 1024;
 const RELEASE_PACK_LARGE_GROUP_BYTES: u64 = 24 * 1024 * 1024;
+const DEFAULT_OVERPASS_BASE_URL: &str = "https://overpass-api.de/api/";
+const CONNECTION_ENDPOINT_MATCH_METERS: f64 = 60.0;
+const CONNECTION_SEGMENT_MATCH_METERS: f64 = 35.0;
+const CONNECTION_SEARCH_PADDING_METERS: f64 = 300.0;
+const NETWORK_BUCKET_DEGREES: f64 = 0.02;
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +49,10 @@ enum Command {
         dataset_version: Option<String>,
         #[arg(long, default_value = "https://tiles.openskimap.org/geojson")]
         source_base_url: String,
+        #[arg(long, default_value = DEFAULT_OVERPASS_BASE_URL)]
+        overpass_base_url: String,
+        #[arg(long)]
+        skip_connection_enrichment: bool,
     },
     /// Build indexes, packages, group archives, and local-app artifacts from cached source files.
     Build {
@@ -68,6 +78,10 @@ enum Command {
         dataset_version: Option<String>,
         #[arg(long, default_value = "https://tiles.openskimap.org/geojson")]
         source_base_url: String,
+        #[arg(long, default_value = DEFAULT_OVERPASS_BASE_URL)]
+        overpass_base_url: String,
+        #[arg(long)]
+        skip_connection_enrichment: bool,
         #[arg(long)]
         skip_fetch: bool,
     },
@@ -80,18 +94,27 @@ fn main() -> Result<()> {
             cache_dir,
             dataset_version,
             source_base_url,
-        } => fetch_sources(&cache_dir, dataset_version, &source_base_url),
+            overpass_base_url,
+            skip_connection_enrichment,
+        } => fetch_sources(
+            &cache_dir,
+            dataset_version,
+            &source_base_url,
+            &overpass_base_url,
+            skip_connection_enrichment,
+        ),
         Command::Build {
             cache_dir,
             output_dir,
             dataset_version,
         } => build_from_cache(&cache_dir, &output_dir, dataset_version).map(|summary| {
             eprintln!(
-                "built dataset {}: {} resorts, {} runs, {} lifts",
+                "built dataset {}: {} resorts, {} runs, {} lifts, {} connections",
                 summary.dataset_version,
                 summary.resort_count,
                 summary.run_count,
-                summary.lift_count
+                summary.lift_count,
+                summary.connection_count
             );
         }),
         Command::Validate { output_dir } => validate_output(&output_dir),
@@ -100,18 +123,27 @@ fn main() -> Result<()> {
             output_dir,
             dataset_version,
             source_base_url,
+            overpass_base_url,
+            skip_connection_enrichment,
             skip_fetch,
         } => {
             if !skip_fetch {
-                fetch_sources(&cache_dir, dataset_version.clone(), &source_base_url)?;
+                fetch_sources(
+                    &cache_dir,
+                    dataset_version.clone(),
+                    &source_base_url,
+                    &overpass_base_url,
+                    skip_connection_enrichment,
+                )?;
             }
             let summary = build_from_cache(&cache_dir, &output_dir, dataset_version)?;
             eprintln!(
-                "built dataset {}: {} resorts, {} runs, {} lifts",
+                "built dataset {}: {} resorts, {} runs, {} lifts, {} connections",
                 summary.dataset_version,
                 summary.resort_count,
                 summary.run_count,
-                summary.lift_count
+                summary.lift_count,
+                summary.connection_count
             );
             validate_output(&output_dir)
         }
@@ -122,6 +154,8 @@ fn fetch_sources(
     cache_dir: &Path,
     dataset_version: Option<String>,
     source_base_url: &str,
+    overpass_base_url: &str,
+    skip_connection_enrichment: bool,
 ) -> Result<()> {
     let dataset_version =
         dataset_version.unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
@@ -167,11 +201,22 @@ fn fetch_sources(
         layers.push(file_metadata(layer, &target, Some(url))?);
     }
 
+    let connection_source = if skip_connection_enrichment {
+        json!({
+            "name": CONNECTIONS_FILE,
+            "status": "skipped",
+            "reason": "skip_connection_enrichment"
+        })
+    } else {
+        fetch_or_extract_connections(&dataset_dir, overpass_base_url, &client)?
+    };
+
     let metadata = json!({
         "datasetVersion": dataset_version,
         "fetchedAt": Utc::now(),
         "sourceFormat": "openskimap-geojson",
         "layers": layers,
+        "connectionEnrichment": connection_source,
     });
     write_json_pretty(&dataset_dir.join("source_metadata.json"), &metadata)?;
     Ok(())
@@ -188,6 +233,238 @@ fn validate_geojson_file(path: &Path) -> Result<()> {
         bail!("expected features array");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionConversionSummary {
+    feature_count: usize,
+    ignored_count: usize,
+}
+
+fn fetch_or_extract_connections(
+    dataset_dir: &Path,
+    overpass_base_url: &str,
+    client: &Client,
+) -> Result<Value> {
+    let target = dataset_dir.join(CONNECTIONS_FILE);
+    if target.exists() {
+        return file_metadata(CONNECTIONS_FILE, &target, None).map(|metadata| {
+            json!({
+                "name": CONNECTIONS_FILE,
+                "status": "cached",
+                "metadata": metadata
+            })
+        });
+    }
+
+    if openskimap_has_connections(dataset_dir)? {
+        let count = write_connections_from_openskimap(dataset_dir, &target)?;
+        let metadata = file_metadata(CONNECTIONS_FILE, &target, None)?;
+        return Ok(json!({
+            "name": CONNECTIONS_FILE,
+            "status": "openskimap",
+            "featureCount": count,
+            "metadata": metadata
+        }));
+    }
+
+    let query = overpass_connection_query();
+    let url = format!("{}/interpreter", overpass_base_url.trim_end_matches('/'));
+    eprintln!("OpenSkiMap has no type=connection features; querying Overpass: {url}");
+    let response = client
+        .post(&url)
+        .form(&[("data", query.as_str())])
+        .send()
+        .with_context(|| format!("querying Overpass {url}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "Overpass connection query failed: HTTP {}",
+            response.status()
+        );
+    }
+    let body = response.text().context("reading Overpass response body")?;
+    let overpass: Value = serde_json::from_str(&body).context("parsing Overpass response")?;
+    let (connections, summary) = overpass_json_to_connection_geojson(&overpass)?;
+    let temp = target.with_extension("geojson.part");
+    write_json_pretty(&temp, &connections)?;
+    validate_geojson_file(&temp)?;
+    fs::rename(&temp, &target)
+        .with_context(|| format!("moving {} to {}", temp.display(), target.display()))?;
+    Ok(json!({
+        "name": CONNECTIONS_FILE,
+        "status": "overpass",
+        "url": url,
+        "querySha256": sha256_text(query.as_str()),
+        "fetchedAt": Utc::now(),
+        "featureCount": summary.feature_count,
+        "ignoredElementCount": summary.ignored_count,
+        "metadata": file_metadata(CONNECTIONS_FILE, &target, Some(url))?
+    }))
+}
+
+fn openskimap_has_connections(dataset_dir: &Path) -> Result<bool> {
+    for layer in LAYER_FILES {
+        let path = dataset_dir.join(layer);
+        if !path.exists() {
+            continue;
+        }
+        let features = read_feature_collection(&path)?;
+        if features
+            .iter()
+            .any(|feature| is_openskimap_connection(&feature.properties))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_connections_from_openskimap(dataset_dir: &Path, target: &Path) -> Result<usize> {
+    let mut features = Vec::new();
+    for layer in LAYER_FILES {
+        let path = dataset_dir.join(layer);
+        if !path.exists() {
+            continue;
+        }
+        for (index, feature) in read_feature_collection(&path)?.into_iter().enumerate() {
+            if !is_openskimap_connection(&feature.properties) {
+                continue;
+            }
+            let id = feature.source_id("connection", index);
+            let mut props = feature.properties;
+            props
+                .entry("id".to_string())
+                .or_insert_with(|| Value::String(id.clone()));
+            props.insert("sourceLayer".to_string(), Value::String(layer.to_string()));
+            features.push(json!({
+                "type": "Feature",
+                "id": id,
+                "properties": props,
+                "geometry": feature.geometry
+            }));
+        }
+    }
+    let count = features.len();
+    write_json_pretty(
+        target,
+        &json!({"type": "FeatureCollection", "features": features}),
+    )?;
+    validate_geojson_file(target)?;
+    Ok(count)
+}
+
+fn is_openskimap_connection(props: &Map<String, Value>) -> bool {
+    first_string(props, &["type"]).is_some_and(|value| value.eq_ignore_ascii_case("connection"))
+}
+
+fn overpass_connection_query() -> String {
+    r#"[out:json][timeout:900];
+(
+  way["piste:type"="connection"](-90,-180,90,180);
+  relation["piste:type"="connection"](-90,-180,90,180);
+);
+out body geom;"#
+        .to_string()
+}
+
+fn overpass_json_to_connection_geojson(
+    root: &Value,
+) -> Result<(Value, ConnectionConversionSummary)> {
+    let elements = root
+        .get("elements")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Overpass response missing elements array"))?;
+    let mut features = Vec::new();
+    let mut ignored_count = 0;
+    for element in elements {
+        match overpass_element_to_connection_feature(element) {
+            Some(feature) => features.push(feature),
+            None => ignored_count += 1,
+        }
+    }
+    let summary = ConnectionConversionSummary {
+        feature_count: features.len(),
+        ignored_count,
+    };
+    Ok((
+        json!({"type": "FeatureCollection", "features": features}),
+        summary,
+    ))
+}
+
+fn overpass_element_to_connection_feature(element: &Value) -> Option<Value> {
+    let object = element.as_object()?;
+    let element_type = object.get("type").and_then(Value::as_str)?;
+    let id_value = object.get("id")?;
+    let osm_id = value_to_string(id_value)?;
+    let feature_id = format!("{element_type}/{osm_id}");
+    let mut props = object
+        .get("tags")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if !value_contains_string(props.get("piste:type")?, "connection") {
+        return None;
+    }
+    props.insert("id".to_string(), Value::String(feature_id.clone()));
+    props.insert("type".to_string(), Value::String("connection".to_string()));
+    props.insert(
+        "osm_type".to_string(),
+        Value::String(element_type.to_string()),
+    );
+    props.insert("osm_id".to_string(), Value::String(osm_id));
+    props.insert(
+        "sources".to_string(),
+        json!([{"id": feature_id, "type": "openstreetmap"}]),
+    );
+
+    let geometry = match element_type {
+        "way" => {
+            let coordinates = overpass_geometry_coordinates(object.get("geometry")?)?;
+            if coordinates.len() < 2 {
+                return None;
+            }
+            json!({"type": "LineString", "coordinates": coordinates})
+        }
+        "relation" => {
+            let mut lines = Vec::new();
+            for member in object
+                .get("members")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(coordinates) = overpass_geometry_coordinates(member.get("geometry")?) {
+                    if coordinates.len() >= 2 {
+                        lines.push(Value::Array(coordinates));
+                    }
+                }
+            }
+            if lines.is_empty() {
+                return None;
+            }
+            json!({"type": "MultiLineString", "coordinates": lines})
+        }
+        _ => return None,
+    };
+
+    Some(json!({
+        "type": "Feature",
+        "id": feature_id,
+        "properties": props,
+        "geometry": geometry
+    }))
+}
+
+fn overpass_geometry_coordinates(geometry: &Value) -> Option<Vec<Value>> {
+    let points = geometry.as_array()?;
+    let mut coordinates = Vec::new();
+    for point in points {
+        let lon = point.get("lon").and_then(Value::as_f64)?;
+        let lat = point.get("lat").and_then(Value::as_f64)?;
+        coordinates.push(json!([lon, lat]));
+    }
+    Some(coordinates)
 }
 
 fn reset_output_dir(output_dir: &Path) -> Result<()> {
@@ -260,14 +537,35 @@ fn build_from_cache(
             bail!("missing cached source layer {}", path.display());
         }
     }
+    let connections_path = dataset_dir.join(CONNECTIONS_FILE);
+    if !connections_path.exists() {
+        if openskimap_has_connections(&dataset_dir)? {
+            bail!(
+                "missing cached connection layer {}; run fetch first to extract OpenSkiMap type=connection features",
+                connections_path.display()
+            );
+        }
+        bail!(
+            "missing cached connection layer {}; run fetch first to query Overpass connection enrichment",
+            connections_path.display()
+        );
+    }
 
     reset_output_dir(output_dir)?;
     let ski_areas = read_feature_collection(&dataset_dir.join("ski_areas.geojson"))?;
     let runs = read_feature_collection(&dataset_dir.join("runs.geojson"))?;
     let lifts = read_feature_collection(&dataset_dir.join("lifts.geojson"))?;
+    let connections = read_feature_collection(&connections_path)?;
 
     let generated_at = Utc::now();
-    let normalized = normalize_sources(ski_areas, runs, lifts, &dataset_version, generated_at)?;
+    let normalized = normalize_sources(
+        ski_areas,
+        runs,
+        lifts,
+        connections,
+        &dataset_version,
+        generated_at,
+    )?;
     write_outputs(output_dir, &normalized)?;
 
     Ok(BuildSummary {
@@ -275,6 +573,7 @@ fn build_from_cache(
         resort_count: normalized.resorts.len(),
         run_count: normalized.runs.len(),
         lift_count: normalized.lifts.len(),
+        connection_count: normalized.connections.len(),
     })
 }
 
@@ -365,6 +664,7 @@ struct BuildSummary {
     resort_count: usize,
     run_count: usize,
     lift_count: usize,
+    connection_count: usize,
 }
 
 #[derive(Debug)]
@@ -374,6 +674,7 @@ struct NormalizedDataset {
     resorts: Vec<ResortRecord>,
     runs: Vec<FeatureRecord>,
     lifts: Vec<FeatureRecord>,
+    connections: Vec<FeatureRecord>,
     warnings: Vec<String>,
 }
 
@@ -423,6 +724,7 @@ fn normalize_sources(
     ski_areas: Vec<SourceFeature>,
     runs: Vec<SourceFeature>,
     lifts: Vec<SourceFeature>,
+    connections: Vec<SourceFeature>,
     dataset_version: &str,
     generated_at: DateTime<Utc>,
 ) -> Result<NormalizedDataset> {
@@ -499,6 +801,7 @@ fn normalize_sources(
     let resort_ids: BTreeSet<String> = resorts.iter().map(|resort| resort.id.clone()).collect();
     let mut normalized_runs = Vec::new();
     let mut normalized_lifts = Vec::new();
+    let mut connection_candidates = Vec::new();
 
     for (index, feature) in runs.into_iter().enumerate() {
         let id = feature.source_id("run", index);
@@ -551,6 +854,29 @@ fn normalize_sources(
         });
     }
 
+    for (index, feature) in connections.into_iter().enumerate() {
+        let id = feature.source_id("connection", index);
+        if !is_openskimap_connection(&feature.properties)
+            && !has_any_value(&feature.properties, &["piste:type"], "connection")
+        {
+            continue;
+        }
+        if !geometry_type(&feature.geometry).is_some_and(|ty| ty.contains("LineString")) {
+            warnings.push(format!("connection {id} skipped: geometry is not linear"));
+            continue;
+        }
+        let status = first_string(&feature.properties, &["status"]).unwrap_or_default();
+        if explicit_non_operating_status(&status) {
+            continue;
+        }
+        connection_candidates.push(FeatureRecord {
+            id,
+            resort_ids: Vec::new(),
+            geometry: feature.geometry,
+            properties: feature.properties,
+        });
+    }
+
     let active_resort_ids = normalized_runs
         .iter()
         .chain(normalized_lifts.iter())
@@ -560,6 +886,13 @@ fn normalize_sources(
 
     apply_feature_bounds_to_resorts(&mut resorts, &normalized_runs, &normalized_lifts);
     compute_resort_hierarchy(&mut resorts, &normalized_runs, &normalized_lifts);
+    let normalized_connections = assign_connections_to_leaf_resorts(
+        connection_candidates,
+        &resorts,
+        &normalized_runs,
+        &normalized_lifts,
+        &mut warnings,
+    );
 
     if resorts.is_empty() {
         bail!("no operating downhill resorts found; check OpenSkiMap schema and source files");
@@ -571,6 +904,7 @@ fn normalize_sources(
         resorts,
         runs: normalized_runs,
         lifts: normalized_lifts,
+        connections: normalized_connections,
         warnings,
     })
 }
@@ -584,9 +918,16 @@ fn write_outputs(output_dir: &Path, dataset: &NormalizedDataset) -> Result<()> {
 
     let runs_by_resort = records_by_resort(&dataset.runs);
     let lifts_by_resort = records_by_resort(&dataset.lifts);
+    let connections_by_resort = records_by_resort(&dataset.connections);
 
     write_discovery_index(output_dir, dataset)?;
-    write_resort_packages(output_dir, dataset, &runs_by_resort, &lifts_by_resort)?;
+    write_resort_packages(
+        output_dir,
+        dataset,
+        &runs_by_resort,
+        &lifts_by_resort,
+        &connections_by_resort,
+    )?;
     write_group_archives(output_dir, dataset)?;
     write_release_packs(output_dir, dataset)?;
     write_local_app_layout(output_dir, dataset)?;
@@ -598,6 +939,7 @@ fn write_outputs(output_dir: &Path, dataset: &NormalizedDataset) -> Result<()> {
         "resortCount": dataset.resorts.len(),
         "runCount": dataset.runs.len(),
         "liftCount": dataset.lifts.len(),
+        "connectionCount": dataset.connections.len(),
         "warnings": dataset.warnings,
     });
     write_json_pretty(&output_dir.join("build-report.json"), &report)?;
@@ -645,6 +987,7 @@ fn write_resort_packages<'a>(
     dataset: &NormalizedDataset,
     runs_by_resort: &BTreeMap<String, Vec<&'a FeatureRecord>>,
     lifts_by_resort: &BTreeMap<String, Vec<&'a FeatureRecord>>,
+    connections_by_resort: &BTreeMap<String, Vec<&'a FeatureRecord>>,
 ) -> Result<()> {
     for resort in &dataset.resorts {
         let package_dir = output_dir
@@ -660,10 +1003,16 @@ fn write_resort_packages<'a>(
 
         let runs = runs_by_resort.get(&resort.id).cloned().unwrap_or_default();
         let lifts = lifts_by_resort.get(&resort.id).cloned().unwrap_or_default();
+        let connections = connections_by_resort
+            .get(&resort.id)
+            .cloned()
+            .unwrap_or_default();
 
         let downhill_lines = line_feature_collection(&runs, resort);
         let downhill_polygons = polygon_feature_collection(&runs, resort);
         let centerlines = centerline_feature_collection(&runs, resort);
+        let connection_lines = connection_feature_collection(&connections, resort);
+        let connection_centerlines = connection_centerline_feature_collection(&connections, resort);
         let lifts_geojson = lift_feature_collection(&lifts);
         let lift_stations = lift_station_feature_collection(&lifts);
         let hints = run_matching_hints(&centerlines, &lifts_geojson, dataset.generated_at);
@@ -672,7 +1021,9 @@ fn write_resort_packages<'a>(
             resort,
             runs.len(),
             lifts.len(),
+            connections.len(),
             &centerlines,
+            &connection_centerlines,
             &lift_stations,
         );
 
@@ -684,6 +1035,11 @@ fn write_resort_packages<'a>(
         write_json_pretty(
             &package_dir.join("downhill_centerlines.geojson"),
             &centerlines,
+        )?;
+        write_json_pretty(&package_dir.join("connections.geojson"), &connection_lines)?;
+        write_json_pretty(
+            &package_dir.join("connection_centerlines.geojson"),
+            &connection_centerlines,
         )?;
         write_json_pretty(&package_dir.join("lifts.geojson"), &lifts_geojson)?;
         write_json_pretty(&package_dir.join("lift_stations.geojson"), &lift_stations)?;
@@ -699,8 +1055,10 @@ fn write_resort_packages<'a>(
             dataset.generated_at,
             runs.len(),
             lifts.len(),
+            connections.len(),
             &centerlines,
             &downhill_polygons,
+            &connection_centerlines,
             &lift_stations,
         );
         write_json_pretty(&package_dir.join("manifest.json"), &manifest)?;
@@ -722,7 +1080,9 @@ fn write_resort_packages<'a>(
             "stats": {
                 "runs": runs.len(),
                 "lifts": lifts.len(),
+                "connections": connections.len(),
                 "centerlines": feature_count(&centerlines),
+                "connectionCenterlines": feature_count(&connection_centerlines),
                 "liftStations": feature_count(&lift_stations)
             },
             "licenses": [
@@ -1295,6 +1655,8 @@ fn write_local_app_layout(output_dir: &Path, dataset: &NormalizedDataset) -> Res
             "downhill_lines.geojson",
             "downhill_centerlines.geojson",
             "downhill_polygons.geojson",
+            "connections.geojson",
+            "connection_centerlines.geojson",
             "lifts.geojson",
             "lift_stations.geojson",
             "run_matching_hints.json",
@@ -1394,6 +1756,8 @@ fn validate_output(output_dir: &Path) -> Result<()> {
             "downhill_lines.geojson",
             "downhill_centerlines.geojson",
             "downhill_polygons.geojson",
+            "connections.geojson",
+            "connection_centerlines.geojson",
             "lifts.geojson",
             "lift_stations.geojson",
             "run_matching_hints.json",
@@ -1492,6 +1856,89 @@ fn centerline_feature_collection(records: &[&FeatureRecord], resort: &ResortReco
                         "none"
                     } else {
                         "openskimap"
+                    }
+                    .to_string(),
+                ),
+            );
+            features.push(json!({
+                "type": "Feature",
+                "id": section_id,
+                "properties": props,
+                "geometry": line
+            }));
+        }
+    }
+    json!({"type": "FeatureCollection", "features": features})
+}
+
+fn connection_feature_collection(records: &[&FeatureRecord], resort: &ResortRecord) -> Value {
+    let features = records
+        .iter()
+        .filter(|record| geometry_type(&record.geometry).is_some_and(|ty| ty.contains("LineString")))
+        .map(|record| {
+            let mut props = normalized_connection_properties(record, resort);
+            props.insert("id".to_string(), Value::String(record.id.clone()));
+            json!({"type": "Feature", "id": record.id, "properties": props, "geometry": record.geometry})
+        })
+        .collect::<Vec<_>>();
+    json!({"type": "FeatureCollection", "features": features})
+}
+
+fn connection_centerline_feature_collection(
+    records: &[&FeatureRecord],
+    resort: &ResortRecord,
+) -> Value {
+    let mut features = Vec::new();
+    for record in records {
+        for (index, line) in line_geometries(&record.geometry).into_iter().enumerate() {
+            let section_id = format!("{}-connection-{index}", record.id);
+            let coordinates = line
+                .get("coordinates")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let start_key = coordinates.first().and_then(endpoint_key_from_coord_value);
+            let end_key = coordinates.last().and_then(endpoint_key_from_coord_value);
+            let mut props = normalized_connection_properties(record, resort);
+            props.insert("run_key".to_string(), Value::String(record.id.clone()));
+            props.insert(
+                "completion_family_key".to_string(),
+                Value::String(record.id.clone()),
+            );
+            props.insert(
+                "completion_section_id".to_string(),
+                Value::String(section_id.clone()),
+            );
+            props.insert(
+                "centerline_id".to_string(),
+                Value::String(section_id.clone()),
+            );
+            props.insert(
+                "source_way_id".to_string(),
+                Value::String(record.id.clone()),
+            );
+            props.insert(
+                "start_endpoint_key".to_string(),
+                opt_string_value(start_key),
+            );
+            props.insert("end_endpoint_key".to_string(), opt_string_value(end_key));
+            let oneway_tag = first_string(&record.properties, &["oneway", "direction"])
+                .unwrap_or_else(|| "unknown".to_string());
+            props.insert(
+                "effective_oneway_tag".to_string(),
+                Value::String(oneway_tag.clone()),
+            );
+            props.insert(
+                "effective_oneway".to_string(),
+                Value::Bool(matches!(oneway_tag.as_str(), "yes" | "true" | "1" | "-1")),
+            );
+            props.insert(
+                "direction_source".to_string(),
+                Value::String(
+                    if oneway_tag == "unknown" {
+                        "none"
+                    } else {
+                        "connection"
                     }
                     .to_string(),
                 ),
@@ -1609,6 +2056,26 @@ fn normalized_run_properties(record: &FeatureRecord, resort: &ResortRecord) -> M
     props
 }
 
+fn normalized_connection_properties(
+    record: &FeatureRecord,
+    resort: &ResortRecord,
+) -> Map<String, Value> {
+    let mut props = record.properties.clone();
+    props.insert("type".to_string(), Value::String("connection".to_string()));
+    props.insert(
+        "feature_kind".to_string(),
+        Value::String("connection".to_string()),
+    );
+    props.insert(
+        "source_way_id".to_string(),
+        Value::String(record.id.clone()),
+    );
+    if let Some(country) = resort.country.clone() {
+        props.insert("country_code".to_string(), Value::String(country));
+    }
+    props
+}
+
 fn run_matching_hints(centerlines: &Value, _lifts: &Value, generated_at: DateTime<Utc>) -> Value {
     let features = centerlines
         .get("features")
@@ -1717,8 +2184,10 @@ fn app_render_manifest(
     generated_at: DateTime<Utc>,
     run_count: usize,
     lift_count: usize,
+    connection_count: usize,
     centerlines: &Value,
     polygons: &Value,
+    connection_centerlines: &Value,
     lift_stations: &Value,
 ) -> Value {
     json!({
@@ -1730,6 +2199,8 @@ fn app_render_manifest(
             "downhillLines": "downhill_lines.geojson",
             "downhillCenterlines": "downhill_centerlines.geojson",
             "downhillPolygons": "downhill_polygons.geojson",
+            "connections": "connections.geojson",
+            "connectionCenterlines": "connection_centerlines.geojson",
             "lifts": "lifts.geojson",
             "liftStations": "lift_stations.geojson",
             "runMatchingHints": "run_matching_hints.json",
@@ -1743,6 +2214,8 @@ fn app_render_manifest(
             "inferredOnewayCenterlineCount": null,
             "unknownDirectionCenterlineCount": null,
             "downhillPolygonFeatureCount": feature_count(polygons),
+            "connectionFeatureCount": connection_count,
+            "connectionCenterlineFeatureCount": feature_count(connection_centerlines),
             "liftFeatureCount": lift_count,
             "liftStationFeatureCount": feature_count(lift_stations)
         }
@@ -1753,7 +2226,9 @@ fn audit_report(
     resort: &ResortRecord,
     run_count: usize,
     lift_count: usize,
+    connection_count: usize,
     centerlines: &Value,
+    connection_centerlines: &Value,
     lift_stations: &Value,
 ) -> Value {
     let mut issues = Vec::new();
@@ -1770,7 +2245,9 @@ fn audit_report(
         "stats": {
             "runs": run_count,
             "lifts": lift_count,
+            "connections": connection_count,
             "centerlines": feature_count(centerlines),
+            "connectionCenterlines": feature_count(connection_centerlines),
             "liftStations": feature_count(lift_stations)
         },
         "issues": issues,
@@ -1880,6 +2357,261 @@ fn compute_resort_hierarchy(
             }
         }
     }
+}
+
+fn assign_connections_to_leaf_resorts(
+    connections: Vec<FeatureRecord>,
+    resorts: &[ResortRecord],
+    runs: &[FeatureRecord],
+    lifts: &[FeatureRecord],
+    warnings: &mut Vec<String>,
+) -> Vec<FeatureRecord> {
+    let leaf_resort_ids = resorts
+        .iter()
+        .filter(|resort| resort.resort_type != "domain")
+        .map(|resort| resort.id.clone())
+        .collect::<BTreeSet<_>>();
+    let source_index = source_resort_index(runs, lifts, &leaf_resort_ids);
+    let network_index = build_network_match_index(runs, lifts, &leaf_resort_ids);
+    let mut assigned = Vec::new();
+
+    for mut connection in connections {
+        let mut resort_ids = ski_area_ids(&connection.properties)
+            .into_iter()
+            .filter(|id| leaf_resort_ids.contains(id))
+            .collect::<BTreeSet<_>>();
+
+        if resort_ids.is_empty() {
+            for source_key in source_keys_from_properties(&connection.properties) {
+                if let Some(ids) = source_index.get(&source_key) {
+                    resort_ids.extend(ids.iter().cloned());
+                }
+            }
+        }
+
+        if resort_ids.is_empty() {
+            resort_ids.extend(network_resort_matches(&connection, &network_index));
+        }
+
+        if resort_ids.is_empty() {
+            warnings.push(format!(
+                "connection {} skipped: no confident leaf resort assignment",
+                connection.id
+            ));
+            continue;
+        }
+
+        connection.resort_ids = resort_ids.into_iter().collect();
+        assigned.push(connection);
+    }
+    assigned
+}
+
+fn source_resort_index(
+    runs: &[FeatureRecord],
+    lifts: &[FeatureRecord],
+    leaf_resort_ids: &BTreeSet<String>,
+) -> HashMap<String, BTreeSet<String>> {
+    let mut index: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for record in runs.iter().chain(lifts.iter()) {
+        let resort_ids = record
+            .resort_ids
+            .iter()
+            .filter(|id| leaf_resort_ids.contains(*id))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if resort_ids.is_empty() {
+            continue;
+        }
+        for key in source_keys_from_properties(&record.properties) {
+            index
+                .entry(key)
+                .or_default()
+                .extend(resort_ids.iter().cloned());
+        }
+    }
+    index
+}
+
+#[derive(Debug)]
+struct NetworkMatchFeature {
+    resort_ids: Vec<String>,
+    bbox: [f64; 4],
+    endpoints: Vec<[f64; 2]>,
+    points: Vec<[f64; 2]>,
+}
+
+#[derive(Debug)]
+struct NetworkMatchIndex {
+    features: Vec<NetworkMatchFeature>,
+    buckets: HashMap<(i32, i32), Vec<usize>>,
+}
+
+fn build_network_match_index(
+    runs: &[FeatureRecord],
+    lifts: &[FeatureRecord],
+    leaf_resort_ids: &BTreeSet<String>,
+) -> NetworkMatchIndex {
+    let features = runs
+        .iter()
+        .chain(lifts.iter())
+        .filter_map(|record| {
+            let resort_ids = record
+                .resort_ids
+                .iter()
+                .filter(|id| leaf_resort_ids.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if resort_ids.is_empty() {
+                return None;
+            }
+            let bbox = bbox_from_geometry(&record.geometry)?;
+            let points = geometry_points(&record.geometry);
+            if points.len() < 2 {
+                return None;
+            }
+            let endpoints = geometry_endpoints(&record.geometry);
+            Some(NetworkMatchFeature {
+                resort_ids,
+                bbox,
+                endpoints,
+                points,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut buckets: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (index, feature) in features.iter().enumerate() {
+        for cell in bbox_cells(padded_bbox_meters(feature.bbox, 50.0)) {
+            buckets.entry(cell).or_default().push(index);
+        }
+    }
+    NetworkMatchIndex { features, buckets }
+}
+
+fn network_resort_matches(
+    connection: &FeatureRecord,
+    network_index: &NetworkMatchIndex,
+) -> BTreeSet<String> {
+    let Some(connection_bbox) = bbox_from_geometry(&connection.geometry) else {
+        return BTreeSet::new();
+    };
+    let search_bbox = padded_bbox_meters(connection_bbox, CONNECTION_SEARCH_PADDING_METERS);
+    let connection_points = geometry_points(&connection.geometry);
+    let connection_endpoints = geometry_endpoints(&connection.geometry);
+    if connection_points.len() < 2 {
+        return BTreeSet::new();
+    }
+
+    let mut scores: HashMap<String, i32> = HashMap::new();
+    for candidate_index in network_index.candidate_indices(search_bbox) {
+        let candidate = &network_index.features[candidate_index];
+        if !bbox_intersects(search_bbox, padded_bbox_meters(candidate.bbox, 50.0)) {
+            continue;
+        }
+        let endpoint_score = endpoint_match_score(&connection_endpoints, &candidate.endpoints);
+        let segment_score = segment_match_score(&connection_points, &candidate.points);
+        let score = endpoint_score * 100 + segment_score * 10;
+        if score == 0 {
+            continue;
+        }
+        for resort_id in &candidate.resort_ids {
+            scores
+                .entry(resort_id.clone())
+                .and_modify(|existing| *existing = (*existing).max(score))
+                .or_insert(score);
+        }
+    }
+
+    let Some(best_score) = scores.values().copied().max() else {
+        return BTreeSet::new();
+    };
+    let threshold = if best_score >= 100 { 100 } else { 20 };
+    if best_score < threshold {
+        return BTreeSet::new();
+    }
+    scores
+        .into_iter()
+        .filter(|(_, score)| *score >= threshold && *score >= best_score - 10)
+        .map(|(resort_id, _)| resort_id)
+        .collect()
+}
+
+impl NetworkMatchIndex {
+    fn candidate_indices(&self, bbox: [f64; 4]) -> Vec<usize> {
+        let mut indices = BTreeSet::new();
+        for cell in bbox_cells(bbox) {
+            if let Some(bucket) = self.buckets.get(&cell) {
+                indices.extend(bucket.iter().copied());
+            }
+        }
+        indices.into_iter().collect()
+    }
+}
+
+fn bbox_cells(bbox: [f64; 4]) -> Vec<(i32, i32)> {
+    let min_x = bucket_coord(bbox[0]);
+    let max_x = bucket_coord(bbox[2]);
+    let min_y = bucket_coord(bbox[1]);
+    let max_y = bucket_coord(bbox[3]);
+    let mut cells = Vec::new();
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            cells.push((x, y));
+        }
+    }
+    cells
+}
+
+fn bucket_coord(value: f64) -> i32 {
+    (value / NETWORK_BUCKET_DEGREES).floor() as i32
+}
+
+fn endpoint_match_score(left: &[[f64; 2]], right: &[[f64; 2]]) -> i32 {
+    let mut matches = 0;
+    for left_point in left {
+        if right.iter().any(|right_point| {
+            haversine_meters(*left_point, *right_point) <= CONNECTION_ENDPOINT_MATCH_METERS
+        }) {
+            matches += 1;
+        }
+    }
+    matches
+}
+
+fn segment_match_score(left_points: &[[f64; 2]], right_points: &[[f64; 2]]) -> i32 {
+    let mut matches = 0;
+    for point in left_points {
+        if min_distance_to_polyline_meters(*point, right_points) <= CONNECTION_SEGMENT_MATCH_METERS
+        {
+            matches += 1;
+        }
+    }
+    matches.min(3)
+}
+
+fn source_keys_from_properties(props: &Map<String, Value>) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    if let Some(sources) = props.get("sources").and_then(Value::as_array) {
+        for source in sources {
+            if let Some(id) = source.get("id").and_then(Value::as_str) {
+                keys.insert(id.to_string());
+            } else if let Some(id) = value_to_string(source) {
+                keys.insert(id);
+            }
+        }
+    }
+    if let Some(source) = first_string(props, &["source"]) {
+        if source.contains('/') {
+            keys.insert(source);
+        }
+    }
+    if let (Some(osm_type), Some(osm_id)) = (
+        first_string(props, &["osm_type"]),
+        first_string(props, &["osm_id"]),
+    ) {
+        keys.insert(format!("{osm_type}/{osm_id}"));
+    }
+    keys
 }
 
 fn collect_names(props: &Map<String, Value>, primary: &str) -> Vec<String> {
@@ -2068,15 +2800,23 @@ fn merge_bbox(left: [f64; 4], right: [f64; 4]) -> [f64; 4] {
 }
 
 fn padded_bbox(bbox: [f64; 4]) -> [f64; 4] {
+    padded_bbox_meters(bbox, 500.0)
+}
+
+fn padded_bbox_meters(bbox: [f64; 4], meters: f64) -> [f64; 4] {
     let center_lat = (bbox[1] + bbox[3]) / 2.0;
-    let lat_delta = 500.0 / 111_320.0;
-    let lon_delta = 500.0 / (111_320.0 * center_lat.to_radians().cos().abs().max(0.1));
+    let lat_delta = meters / 111_320.0;
+    let lon_delta = meters / (111_320.0 * center_lat.to_radians().cos().abs().max(0.1));
     [
         bbox[0] - lon_delta,
         bbox[1] - lat_delta,
         bbox[2] + lon_delta,
         bbox[3] + lat_delta,
     ]
+}
+
+fn bbox_intersects(left: [f64; 4], right: [f64; 4]) -> bool {
+    left[0] <= right[2] && left[2] >= right[0] && left[1] <= right[3] && left[3] >= right[1]
 }
 
 fn invalid_or_point_bbox(bbox: [f64; 4]) -> bool {
@@ -2118,6 +2858,74 @@ fn line_endpoints(geometry: &Value) -> (Option<Value>, Option<Value>) {
     let start = coords.and_then(|items| items.first()).cloned();
     let end = coords.and_then(|items| items.last()).cloned();
     (start, end)
+}
+
+fn geometry_points(geometry: &Value) -> Vec<[f64; 2]> {
+    let mut points = Vec::new();
+    scan_coordinates(
+        geometry.get("coordinates").unwrap_or(&Value::Null),
+        &mut |lon, lat| {
+            points.push([lon, lat]);
+        },
+    );
+    points
+}
+
+fn geometry_endpoints(geometry: &Value) -> Vec<[f64; 2]> {
+    let mut endpoints = Vec::new();
+    for line in line_geometries(geometry) {
+        let Some(coords) = line.get("coordinates").and_then(Value::as_array) else {
+            continue;
+        };
+        for coord in [coords.first(), coords.last()].into_iter().flatten() {
+            if let Some(point) = point_from_coord_value(coord) {
+                endpoints.push(point);
+            }
+        }
+    }
+    endpoints
+}
+
+fn point_from_coord_value(value: &Value) -> Option<[f64; 2]> {
+    let items = value.as_array()?;
+    Some([items.first()?.as_f64()?, items.get(1)?.as_f64()?])
+}
+
+fn haversine_meters(left: [f64; 2], right: [f64; 2]) -> f64 {
+    let radius = 6_371_000.0;
+    let lat1 = left[1].to_radians();
+    let lat2 = right[1].to_radians();
+    let dlat = (right[1] - left[1]).to_radians();
+    let dlon = (right[0] - left[0]).to_radians();
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * radius * h.sqrt().asin()
+}
+
+fn min_distance_to_polyline_meters(point: [f64; 2], line: &[[f64; 2]]) -> f64 {
+    if line.len() < 2 {
+        return f64::INFINITY;
+    }
+    line.windows(2)
+        .map(|segment| point_segment_distance_meters(point, segment[0], segment[1]))
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn point_segment_distance_meters(point: [f64; 2], start: [f64; 2], end: [f64; 2]) -> f64 {
+    let lat = ((point[1] + start[1] + end[1]) / 3.0).to_radians();
+    let meters_per_degree_lon = 111_320.0 * lat.cos().abs().max(0.1);
+    let to_xy = |coord: [f64; 2]| [coord[0] * meters_per_degree_lon, coord[1] * 111_320.0];
+    let p = to_xy(point);
+    let a = to_xy(start);
+    let b = to_xy(end);
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let ap = [p[0] - a[0], p[1] - a[1]];
+    let ab_len2 = ab[0] * ab[0] + ab[1] * ab[1];
+    if ab_len2 == 0.0 {
+        return ((p[0] - a[0]).powi(2) + (p[1] - a[1]).powi(2)).sqrt();
+    }
+    let t = ((ap[0] * ab[0] + ap[1] * ab[1]) / ab_len2).clamp(0.0, 1.0);
+    let projection = [a[0] + t * ab[0], a[1] + t * ab[1]];
+    ((p[0] - projection[0]).powi(2) + (p[1] - projection[1]).powi(2)).sqrt()
 }
 
 fn station_point_geometry(value: &Value) -> Option<Value> {
@@ -2178,6 +2986,14 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+fn explicit_non_operating_status(status: &str) -> bool {
+    !status.is_empty()
+        && !matches!(
+            status.to_ascii_lowercase().as_str(),
+            "operating" | "open" | "active"
+        )
+}
+
 fn opt_string_value(value: Option<String>) -> Value {
     value.map(Value::String).unwrap_or(Value::Null)
 }
@@ -2229,6 +3045,12 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn sha256_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn file_metadata(layer: &str, path: &Path, source_url: Option<String>) -> Result<Value> {
@@ -2357,6 +3179,328 @@ mod tests {
     }
 
     #[test]
+    fn openskimap_connection_detection_uses_geojson_type_property() -> Result<()> {
+        let cache = TempDir::new()?;
+        let dataset_dir = cache.path().join("2026-06-04");
+        fs::create_dir_all(&dataset_dir)?;
+        write_json_pretty(
+            &dataset_dir.join("runs.geojson"),
+            &json!({
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"id": "run-1", "type": "run", "piste:type": "connection"},
+                        "geometry": {"type": "LineString", "coordinates": [[10.0, 46.0], [10.1, 46.1]]}
+                    }
+                ]
+            }),
+        )?;
+        write_json_pretty(
+            &dataset_dir.join("lifts.geojson"),
+            &json!({"type": "FeatureCollection", "features": []}),
+        )?;
+        write_json_pretty(
+            &dataset_dir.join("ski_areas.geojson"),
+            &json!({
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "properties": {"id": "connection-1", "type": "connection"},
+                    "geometry": {"type": "LineString", "coordinates": [[10.0, 46.0], [10.1, 46.1]]}
+                }]
+            }),
+        )?;
+
+        assert!(openskimap_has_connections(&dataset_dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn overpass_way_conversion_preserves_raw_piste_type_and_adds_openskimap_type() -> Result<()> {
+        let (collection, summary) = overpass_json_to_connection_geojson(&json!({
+            "elements": [
+                {
+                    "type": "way",
+                    "id": 49436042,
+                    "geometry": [
+                        {"lat": 46.5593027, "lon": 11.9532744},
+                        {"lat": 46.5594386, "lon": 11.9534193}
+                    ],
+                    "tags": {
+                        "name": "Armentarola",
+                        "piste:type": "connection"
+                    }
+                },
+                {"type": "way", "id": 1, "tags": {"piste:type": "connection"}}
+            ]
+        }))?;
+
+        assert_eq!(summary.feature_count, 1);
+        assert_eq!(summary.ignored_count, 1);
+        let feature = collection
+            .get("features")
+            .and_then(Value::as_array)
+            .and_then(|features| features.first())
+            .expect("converted feature");
+        assert_eq!(
+            feature.get("id").and_then(Value::as_str),
+            Some("way/49436042")
+        );
+        let props = feature
+            .get("properties")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            props.get("type").and_then(Value::as_str),
+            Some("connection")
+        );
+        assert_eq!(
+            props.get("piste:type").and_then(Value::as_str),
+            Some("connection")
+        );
+        assert_eq!(
+            props.get("osm_id").and_then(Value::as_str),
+            Some("49436042")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_dolomiti_connection_is_packaged_with_leaf_resort_not_domain() -> Result<()> {
+        let cache = TempDir::new()?;
+        let dataset_dir = cache.path().join("2026-06-04");
+        fs::create_dir_all(&dataset_dir)?;
+        let dolomiti_id = "480f0abbee27a7e26a20a29d9bf947db63bef9a9";
+        let alta_badia_id = "41ca531357e0d2a532b8ab94e3e9fe74ddbe88c4";
+
+        write_json_pretty(
+            &dataset_dir.join("ski_areas.geojson"),
+            &json!({
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": dolomiti_id,
+                            "name": "Dolomiti Superski",
+                            "status": "operating",
+                            "activities": ["downhill"],
+                            "places": [{"iso3166_2": "IT-BL", "iso3166_1Alpha2": "IT"}]
+                        },
+                        "geometry": {"type": "Polygon", "coordinates": [[[11.8, 46.4], [12.1, 46.4], [12.1, 46.7], [11.8, 46.7], [11.8, 46.4]]]}
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": alta_badia_id,
+                            "name": "Alta Badia",
+                            "status": "operating",
+                            "activities": ["downhill"],
+                            "places": [{"iso3166_2": "IT-BZ", "iso3166_1Alpha2": "IT"}]
+                        },
+                        "geometry": {"type": "Polygon", "coordinates": [[[11.9, 46.5], [12.0, 46.5], [12.0, 46.6], [11.9, 46.6], [11.9, 46.5]]]}
+                    }
+                ]
+            }),
+        )?;
+        write_json_pretty(
+            &dataset_dir.join("runs.geojson"),
+            &json!({
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "properties": {
+                        "id": "armentarola-run",
+                        "name": "Armentarola",
+                        "uses": ["downhill"],
+                        "status": "operating",
+                        "sources": [{"id": "way/49436042", "type": "openstreetmap"}],
+                        "skiAreas": [dolomiti_id, alta_badia_id]
+                    },
+                    "geometry": {"type": "LineString", "coordinates": [[11.9532744, 46.5593027], [11.9534193, 46.5594386]]}
+                }]
+            }),
+        )?;
+        write_json_pretty(
+            &dataset_dir.join("lifts.geojson"),
+            &json!({"type": "FeatureCollection", "features": []}),
+        )?;
+        write_json_pretty(
+            &dataset_dir.join("connections.geojson"),
+            &json!({
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "id": "way/49436042",
+                    "properties": {
+                        "id": "way/49436042",
+                        "name": "Armentarola",
+                        "type": "connection",
+                        "piste:type": "connection",
+                        "osm_type": "way",
+                        "osm_id": "49436042",
+                        "sources": [{"id": "way/49436042", "type": "openstreetmap"}]
+                    },
+                    "geometry": {"type": "LineString", "coordinates": [[11.9532744, 46.5593027], [11.9534193, 46.5594386]]}
+                }]
+            }),
+        )?;
+
+        let output = TempDir::new()?;
+        build_from_cache(cache.path(), output.path(), Some("2026-06-04".to_string()))?;
+
+        let leaf_connections = read_json(
+            &output
+                .path()
+                .join("packages/resorts")
+                .join(alta_badia_id)
+                .join("connections.geojson"),
+        )?;
+        assert_eq!(feature_count(&leaf_connections), 1);
+        let parent_connections = output
+            .path()
+            .join("packages/resorts")
+            .join(dolomiti_id)
+            .join("connections.geojson");
+        assert!(!parent_connections.exists());
+        let resorts = read_json(&output.path().join("resorts.json"))?;
+        let alta_badia = resorts
+            .get("resorts")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .find(|resort| resort.get("id").and_then(Value::as_str) == Some(alta_badia_id))
+            .expect("Alta Badia resort");
+        assert_eq!(
+            alta_badia.get("parent_id").and_then(Value::as_str),
+            Some(dolomiti_id)
+        );
+        validate_output(output.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn connection_assignment_uses_explicit_leaf_ski_area() {
+        let mut warnings = Vec::new();
+        let leaf_id = "leaf-a".to_string();
+        let connections = vec![connection_record(
+            "explicit-connection",
+            json!({
+                "id": "explicit-connection",
+                "type": "connection",
+                "skiAreas": ["domain-a", "leaf-a"]
+            }),
+            json!({"type": "LineString", "coordinates": [[10.0, 46.0], [10.01, 46.01]]}),
+        )];
+        let assigned = assign_connections_to_leaf_resorts(
+            connections,
+            &domain_and_leaf_resorts("domain-a", &leaf_id),
+            &[],
+            &[],
+            &mut warnings,
+        );
+
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].resort_ids, vec![leaf_id]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn connection_assignment_uses_network_proximity_and_rejects_bbox_only_matches() {
+        let leaf_id = "leaf-a".to_string();
+        let resorts = domain_and_leaf_resorts("domain-a", &leaf_id);
+        let run = feature_record(
+            "run-a",
+            vec![leaf_id.clone()],
+            json!({"id": "run-a", "uses": ["downhill"]}),
+            json!({"type": "LineString", "coordinates": [[10.0, 46.0], [10.01, 46.0]]}),
+        );
+
+        let mut warnings = Vec::new();
+        let assigned = assign_connections_to_leaf_resorts(
+            vec![connection_record(
+                "network-connection",
+                json!({"id": "network-connection", "type": "connection"}),
+                json!({"type": "LineString", "coordinates": [[10.01, 46.0], [10.02, 46.0]]}),
+            )],
+            &resorts,
+            std::slice::from_ref(&run),
+            &[],
+            &mut warnings,
+        );
+
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].resort_ids, vec![leaf_id.clone()]);
+        assert!(warnings.is_empty());
+
+        let mut warnings = Vec::new();
+        let rejected = assign_connections_to_leaf_resorts(
+            vec![connection_record(
+                "bbox-only-connection",
+                json!({"id": "bbox-only-connection", "type": "connection"}),
+                json!({"type": "LineString", "coordinates": [[10.0, 46.002], [10.01, 46.002]]}),
+            )],
+            &resorts,
+            &[run],
+            &[],
+            &mut warnings,
+        );
+
+        assert!(rejected.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bbox-only-connection"));
+    }
+
+    #[test]
+    fn connection_assignment_duplicates_real_bridge_between_leaf_resorts() {
+        let left_id = "alta-badia".to_string();
+        let right_id = "sellaronda".to_string();
+        let mut resorts = domain_and_leaf_resorts("dolomiti", &left_id);
+        resorts.push(test_resort(
+            &right_id,
+            "Sellaronda",
+            "resort",
+            Some("dolomiti"),
+        ));
+        let left_run = feature_record(
+            "left-run",
+            vec![left_id.clone()],
+            json!({"id": "left-run", "uses": ["downhill"]}),
+            json!({"type": "LineString", "coordinates": [[11.9532744, 46.5593027], [11.9534193, 46.5594386]]}),
+        );
+        let right_run = feature_record(
+            "right-run",
+            vec![right_id.clone()],
+            json!({"id": "right-run", "uses": ["downhill"]}),
+            json!({"type": "LineString", "coordinates": [[11.9534193, 46.5594386], [11.95355, 46.55955]]}),
+        );
+        let connection = connection_record(
+            "way/49436042",
+            json!({
+                "id": "way/49436042",
+                "name": "Armentarola",
+                "type": "connection",
+                "piste:type": "connection"
+            }),
+            json!({"type": "LineString", "coordinates": [[11.9532744, 46.5593027], [11.9534193, 46.5594386]]}),
+        );
+
+        let mut warnings = Vec::new();
+        let assigned = assign_connections_to_leaf_resorts(
+            vec![connection],
+            &resorts,
+            &[left_run, right_run],
+            &[],
+            &mut warnings,
+        );
+
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].resort_ids, vec![left_id, right_id]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn build_pipeline_writes_local_app_layout() -> Result<()> {
         let cache = TempDir::new()?;
         let dataset_dir = cache.path().join("2026-06-03");
@@ -2413,6 +3557,10 @@ mod tests {
                     "geometry": {"type": "LineString", "coordinates": [[10.1, 46.0], [10.0, 46.1]]}
                 }]
             }),
+        )?;
+        write_json_pretty(
+            &dataset_dir.join("connections.geojson"),
+            &json!({"type": "FeatureCollection", "features": []}),
         )?;
 
         let output = TempDir::new()?;
@@ -2497,5 +3645,58 @@ mod tests {
             .expect("small groups pack");
         assert_eq!(small_pack.archive_type, "small-groups");
         assert_eq!(small_pack.groups.len(), 2);
+    }
+
+    fn domain_and_leaf_resorts(domain_id: &str, leaf_id: &str) -> Vec<ResortRecord> {
+        vec![
+            test_resort(domain_id, "Domain", "domain", None),
+            test_resort(leaf_id, "Leaf", "resort", Some(domain_id)),
+        ]
+    }
+
+    fn test_resort(
+        id: &str,
+        name: &str,
+        resort_type: &str,
+        parent_id: Option<&str>,
+    ) -> ResortRecord {
+        ResortRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            names: vec![name.to_string()],
+            resort_type: resort_type.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            parent_name: parent_id.map(|_| "Domain".to_string()),
+            bbox: [10.0, 46.0, 10.02, 46.02],
+            area_km2: 1.0,
+            country: Some("IT".to_string()),
+            iso_codes: vec!["IT-BZ".to_string()],
+            country_codes: vec!["IT".to_string()],
+            group_id: "IT-BZ".to_string(),
+            center: [10.01, 46.01],
+            artifact_manifest_path: format!("packages/resorts/{id}/artifact_manifest.json"),
+            child_ids: Vec::new(),
+            run_convention: Some("europe".to_string()),
+            places: Value::Null,
+            statistics: Value::Null,
+        }
+    }
+
+    fn connection_record(id: &str, properties: Value, geometry: Value) -> FeatureRecord {
+        feature_record(id, Vec::new(), properties, geometry)
+    }
+
+    fn feature_record(
+        id: &str,
+        resort_ids: Vec<String>,
+        properties: Value,
+        geometry: Value,
+    ) -> FeatureRecord {
+        FeatureRecord {
+            id: id.to_string(),
+            resort_ids,
+            properties: properties.as_object().cloned().unwrap_or_default(),
+            geometry,
+        }
     }
 }

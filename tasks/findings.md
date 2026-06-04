@@ -3,14 +3,16 @@
 ## Source Format
 
 - OpenSkiMap GeoJSON is the source of truth for this pipeline.
-- Overpass is intentionally not a fallback.
+- Overpass is only a narrow `fetch`-time fallback for missing OpenSkiMap GeoJSON connection features. OpenSkiMap uses `properties.type = "connection"`; raw OSM/Overpass uses `piste:type=connection`.
 - The GeoJSON `skiAreas` association on run/lift features is required for correct resort assignment.
+- Connection features must be assigned to leaf resort packages before archives are built; group archives and release packs should inherit them by copying resort packages.
 
 ## Artifact Shape
 
 - `rendering_features.geojson` had no SkiNav consumer and duplicated split render layers, so it was removed.
 - Per-package raw `runs.geojson` was removed; the dated OpenSkiMap cache is the raw source snapshot.
 - Parent domains such as Dolomiti Superski should not own copied child run/lift artifacts. They are reference-only packages.
+- Parent domains such as Dolomiti Superski should not own copied child connection artifacts either. Connections belong in the lowest matching leaf resort package, with multi-resort bridge connections duplicated into each matching leaf package.
 
 ## Release Shape
 

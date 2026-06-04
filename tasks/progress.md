@@ -20,9 +20,19 @@
 - Domain records: 79
 - Runs: 96,152
 - Lifts: 23,690
+- Assigned connections: 2,639
 - Group archives: 627
 - Generated output: 1.6 GB
 - Source cache: 1.0 GB
+
+## 2026-06-04
+
+- Added `connections.geojson` source enrichment for OpenSkiMap connection features.
+- Confirmed cached OpenSkiMap `2026-06-03` does not contain GeoJSON `type=connection`; fetched fallback raw OSM `piste:type=connection` data from Overpass.
+- Cached 3,058 Overpass connection features in `data/raw/openskimap/2026-06-03/connections.geojson`; 3 malformed/non-linear elements were ignored during conversion.
+- Built and validated the enriched 2026-06-03 output with 2,639 confidently assigned leaf-resort connections.
+- Verified real Dolomiti connection `way/49436042` is packaged in Alta Badia leaf resort `41ca531357e0d2a532b8ab94e3e9fe74ddbe88c4`, not in Dolomiti Superski domain `480f0abbee27a7e26a20a29d9bf947db63bef9a9`.
+- Verified Alta Badia connection files are present in `output/groups/IT-BL.tar.gz` and `output/release-packs/IT-BL.part-002-of-007.tar.gz`.
 
 ## Known Follow-Up Work
 

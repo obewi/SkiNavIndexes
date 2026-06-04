@@ -14,6 +14,12 @@ The authoritative upstream inputs are the OpenSkiMap GeoJSON layers at:
 
 The CLI caches these files under `data/raw/openskimap/<dataset-version>/` by default. Treat the cache as the normal development path: fetch once for a dataset version, then rebuild and validate from the local files.
 
+Connection features are cached as an enrichment layer at:
+
+- `data/raw/openskimap/<dataset-version>/connections.geojson`
+
+OpenSkiMap GeoJSON is checked first. When OpenSkiMap contains connection features, they are identified by `properties.type = "connection"` and copied into `connections.geojson`. When OpenSkiMap does not yet contain those features, `fetch` uses a narrow Overpass fallback for raw OSM `piste:type=connection` ways and relations. The default Overpass base URL is `https://overpass-api.de/api/`, and requests use the SkiNavIndexes user agent configured in the CLI. Overpass is only used by `fetch`; `build` and `all --skip-fetch` never query the network.
+
 ## Commands
 
 Run commands through Cargo during development:
@@ -66,18 +72,21 @@ cargo run --release -- build --cache-dir data/raw/openskimap --output-dir output
 
 # Point at a compatible OpenSkiMap GeoJSON base URL.
 cargo run --release -- fetch --source-base-url https://tiles.openskimap.org/geojson
+
+# Point connection enrichment at a different Overpass API base URL.
+cargo run --release -- fetch --overpass-base-url https://overpass-api.de/api/
 ```
 
 ## One-Download Cache Policy
 
 The intended workflow is:
 
-1. Run `cargo run --release -- fetch --dataset-version <version>` once for the dataset version.
+1. Run `cargo run --release -- fetch --dataset-version <version>` once for the dataset version. This downloads missing OpenSkiMap layers and creates `connections.geojson` from OpenSkiMap `type=connection` features or the Overpass fallback.
 2. Re-run `cargo run --release -- build --dataset-version <version>` as often as needed.
 3. Re-run `cargo run --release -- validate` after builds.
 4. Use `cargo run --release -- all --dataset-version <version> --skip-fetch` when you want the full local build and validation path without touching the network.
 
-Do not delete `data/raw/openskimap/<dataset-version>/` just to force a rebuild. Delete or replace cached source files only when intentionally moving to a new upstream snapshot.
+Do not delete `data/raw/openskimap/<dataset-version>/` just to force a rebuild. Delete or replace cached source files only when intentionally moving to a new upstream snapshot. If `connections.geojson` is missing, run `fetch` for that dataset version before building; the build step will fail rather than silently querying Overpass.
 
 ## Output Layout
 
@@ -98,6 +107,8 @@ output/
 │           ├── downhill_lines.geojson
 │           ├── downhill_polygons.geojson
 │           ├── downhill_centerlines.geojson
+│           ├── connections.geojson
+│           ├── connection_centerlines.geojson
 │           ├── run_matching_hints.json
 │           ├── explore_detail.json
 │           ├── audit_report.json
