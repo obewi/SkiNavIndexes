@@ -2,7 +2,7 @@
 
 Rust CLI for building SkiNav discovery indexes and offline resort artifacts from cached OpenSkiMap GeoJSON snapshots.
 
-The current pipeline is intentionally source-specific: it consumes OpenSkiMap GeoJSON layer files, builds backward-compatible discovery output for SkiNav, and emits richer per-resort packages for local device and simulator testing before any release publishing path is trusted.
+The current pipeline is intentionally source-specific: it consumes OpenSkiMap GeoJSON layer files, builds backward-compatible discovery output for SkiNav.
 
 ## Data Source
 
@@ -13,19 +13,6 @@ The authoritative upstream inputs are the OpenSkiMap GeoJSON layers at:
 - `https://tiles.openskimap.org/geojson/runs.geojson`
 
 The CLI caches these files under `data/raw/openskimap/<dataset-version>/` by default. Treat the cache as the normal development path: fetch once for a dataset version, then rebuild and validate from the local files.
-
-The owner constraint is to avoid repeated upstream downloads. In day-to-day development, use `--skip-fetch` once the day's source files are cached.
-
-The strategy PDF refers to `tiles.skimap.org`; this implementation and these docs use the current CLI default requested for this repository: `https://tiles.openskimap.org/geojson`.
-
-## Non-Goals
-
-- No Overpass fallback. If OpenSkiMap is unavailable or missing required fields, the pipeline should fail visibly instead of silently reverting to Overpass.
-- No GeoPackage geometry source for this pass. The pipeline uses the separate GeoJSON layers because they preserve routing and rendering fields needed by SkiNav.
-- No CSV geometry source. CSV snapshots can be useful for audits, but they are not routing or rendering inputs.
-- No on-device Overpass dependency. Local app testing should consume generated files from this repository.
-- No binary `SKIGRAPH` generation in this first pass. `output/local-app/graphs/` contains graph metadata with `status: "not-built"` until the shared SkiNav graph builder contract owns binary graph creation.
-- No one-asset-per-resort release layout. Resort packages are grouped into ISO-derived archives to stay compatible with GitHub release asset limits.
 
 ## Commands
 
@@ -140,48 +127,6 @@ Key files:
 - `output/local-app/...` is the local seeding surface for device and simulator validation. It includes `resorts.json`, `latest.json`, `manifest.json`, `render-bundles/<resort-id>/...`, and `graphs/*.graph.meta.json`.
 
 The pipeline intentionally does not generate `rendering_features.geojson`: that file duplicated `downhill_lines.geojson`, `downhill_polygons.geojson`, and `lifts.geojson`, and SkiNav does not consume it. Per-resort raw `runs.geojson` is also omitted because the cached OpenSkiMap source snapshot is the canonical raw input and SkiNav local artifacts do not read package raw-run files.
-
-The 2026-06-03 full cached build produced:
-
-- `4,494` resorts, including `79` domain records.
-- `96,152` downhill runs and `23,690` lifts from the OpenSkiMap source layers.
-- `627` group archives.
-- `1.6 GB` generated `output/`, down from `5.6 GB` before removing duplicate files and domain payload duplication.
-- `output/local-app/` is about `1.3 GB` when measured by itself. In the combined `output/` tree it adds little extra disk usage on APFS because local-app render files are hard links to package files when supported.
-
-Generated raw and output artifacts are intentionally ignored by Git. Commit source, schemas, code, plans, workflow files, and the root `latest.json` entrypoint; regenerate `output/*` locally or in GitHub Actions.
-
-## Local App Testing
-
-Local/on-device validation comes before GitHub Actions or release publishing.
-
-1. Fetch once for the dataset version:
-
-   ```bash
-   cargo run --release -- fetch --dataset-version 2026-06-03
-   ```
-
-2. Rebuild and validate from cache:
-
-   ```bash
-   cargo run --release -- all --dataset-version 2026-06-03 --skip-fetch
-   ```
-
-3. Seed SkiNav from `output/local-app/`.
-
-   The generated local app directory mirrors the SkiNav document layout used for offline testing:
-
-   ```text
-   output/local-app/resorts.json
-   output/local-app/latest.json
-   output/local-app/manifest.json
-   output/local-app/graphs/
-   output/local-app/render-bundles/
-   ```
-
-4. Run SkiNav against those local files on the simulator or device and inspect routing/rendering behavior before considering any release publication.
-
-The first-pass local app layout supplies render artifacts and graph metadata only. `output/local-app/manifest.json` has `containsBinaryGraphs: false`; binary graph generation is deferred to the shared SkiNav graph builder contract.
 
 ## GitHub Workflow
 
