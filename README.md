@@ -109,10 +109,7 @@ output/
 │           ├── downhill_centerlines.geojson
 │           ├── connections.geojson
 │           ├── connection_centerlines.geojson
-│           ├── run_matching_hints.json
-│           ├── explore_detail.json
-│           ├── audit_report.json
-│           └── checksums.json
+│           └── audit_report.json
 ├── groups/
 │   └── <group>.tar.gz
 ├── release-packs/

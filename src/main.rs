@@ -682,7 +682,6 @@ struct NormalizedDataset {
 struct ResortRecord {
     id: String,
     name: String,
-    names: Vec<String>,
     #[serde(rename = "type")]
     resort_type: String,
     #[serde(rename = "parent_id")]
@@ -700,8 +699,6 @@ struct ResortRecord {
     #[serde(rename = "groupId")]
     group_id: String,
     center: [f64; 2],
-    #[serde(rename = "artifactManifestPath")]
-    artifact_manifest_path: String,
     #[serde(rename = "childIds")]
     child_ids: Vec<String>,
     #[serde(skip)]
@@ -748,11 +745,6 @@ fn normalize_sources(
             continue;
         }
 
-        let mut names = collect_names(&feature.properties, &name);
-        if names.is_empty() {
-            names.push(name.clone());
-        }
-
         let geometry_bbox = bbox_from_geometry(&feature.geometry);
         let bbox = geometry_bbox.unwrap_or([0.0, 0.0, 0.0, 0.0]);
         let center = bbox_center(bbox);
@@ -768,7 +760,6 @@ fn normalize_sources(
         resorts.push(ResortRecord {
             id: id.clone(),
             name,
-            names,
             resort_type: "resort".to_string(),
             parent_id: None,
             parent_name: None,
@@ -779,10 +770,6 @@ fn normalize_sources(
             country_codes,
             group_id,
             center,
-            artifact_manifest_path: format!(
-                "packages/resorts/{}/artifact_manifest.json",
-                safe_path_id(&id)
-            ),
             child_ids: Vec::new(),
             run_convention: first_string(&feature.properties, &["runConvention", "run_convention"]),
             places: feature
@@ -1015,8 +1002,6 @@ fn write_resort_packages<'a>(
         let connection_centerlines = connection_centerline_feature_collection(&connections, resort);
         let lifts_geojson = lift_feature_collection(&lifts);
         let lift_stations = lift_station_feature_collection(&lifts);
-        let hints = run_matching_hints(&centerlines, &lifts_geojson, dataset.generated_at);
-        let explore_detail = empty_explore_detail(dataset.generated_at);
         let audit = audit_report(
             resort,
             runs.len(),
@@ -1043,12 +1028,7 @@ fn write_resort_packages<'a>(
         )?;
         write_json_pretty(&package_dir.join("lifts.geojson"), &lifts_geojson)?;
         write_json_pretty(&package_dir.join("lift_stations.geojson"), &lift_stations)?;
-        write_json_pretty(&package_dir.join("run_matching_hints.json"), &hints)?;
-        write_json_pretty(&package_dir.join("explore_detail.json"), &explore_detail)?;
         write_json_pretty(&package_dir.join("audit_report.json"), &audit)?;
-
-        let checksums = checksums_for_dir(&package_dir)?;
-        write_json_pretty(&package_dir.join("checksums.json"), &checksums)?;
 
         let manifest = app_render_manifest(
             resort,
@@ -1063,6 +1043,7 @@ fn write_resort_packages<'a>(
         );
         write_json_pretty(&package_dir.join("manifest.json"), &manifest)?;
 
+        let files = file_manifest_for_dir(&package_dir)?;
         let artifact_manifest = json!({
             "schemaVersion": PIPELINE_SCHEMA_VERSION,
             "datasetVersion": dataset.dataset_version,
@@ -1076,7 +1057,7 @@ fn write_resort_packages<'a>(
             "runConvention": resort.run_convention,
             "statistics": resort.statistics,
             "places": resort.places,
-            "files": checksums,
+            "files": files,
             "stats": {
                 "runs": runs.len(),
                 "lifts": lifts.len(),
@@ -1115,7 +1096,6 @@ fn write_domain_package(
         .map(|child_id| {
             json!({
                 "id": child_id,
-                "artifactManifestPath": format!("../{}/artifact_manifest.json", safe_path_id(child_id)),
                 "renderBundlePath": format!("../{}/manifest.json", safe_path_id(child_id))
             })
         })
@@ -1148,9 +1128,7 @@ fn write_domain_package(
     });
     write_json_pretty(&package_dir.join("audit_report.json"), &audit)?;
 
-    let checksums = checksums_for_dir(package_dir)?;
-    write_json_pretty(&package_dir.join("checksums.json"), &checksums)?;
-
+    let files = file_manifest_for_dir(package_dir)?;
     let artifact_manifest = json!({
         "schemaVersion": PIPELINE_SCHEMA_VERSION,
         "datasetVersion": dataset.dataset_version,
@@ -1167,7 +1145,7 @@ fn write_domain_package(
         "places": resort.places,
         "childIds": resort.child_ids,
         "childArtifacts": child_artifacts,
-        "files": checksums,
+        "files": files,
         "stats": {
             "children": resort.child_ids.len(),
             "runs": 0,
@@ -1659,8 +1637,6 @@ fn write_local_app_layout(output_dir: &Path, dataset: &NormalizedDataset) -> Res
             "connection_centerlines.geojson",
             "lifts.geojson",
             "lift_stations.geojson",
-            "run_matching_hints.json",
-            "explore_detail.json",
         ] {
             hard_link_or_copy(&package_dir.join(file), &render_target.join(file))
                 .with_context(|| format!("linking local-app render file {file}"))?;
@@ -1760,8 +1736,6 @@ fn validate_output(output_dir: &Path) -> Result<()> {
             "connection_centerlines.geojson",
             "lifts.geojson",
             "lift_stations.geojson",
-            "run_matching_hints.json",
-            "explore_detail.json",
             "audit_report.json",
         ] {
             validate_geojson_or_json_exists(&packages.join(safe_path_id(id)).join(file))?;
@@ -2076,109 +2050,6 @@ fn normalized_connection_properties(
     props
 }
 
-fn run_matching_hints(centerlines: &Value, _lifts: &Value, generated_at: DateTime<Utc>) -> Value {
-    let features = centerlines
-        .get("features")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut source_way_to_family = Map::new();
-    let mut endpoints = Map::new();
-    let mut endpoint_to_sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for feature in &features {
-        let Some(props) = feature.get("properties").and_then(Value::as_object) else {
-            continue;
-        };
-        let Some(section_id) = first_string(props, &["completion_section_id", "centerline_id"])
-        else {
-            continue;
-        };
-        let family = first_string(props, &["completion_family_key", "run_key"])
-            .unwrap_or_else(|| section_id.clone());
-        if let Some(source_way) = first_string(props, &["source_way_id"]) {
-            source_way_to_family.insert(source_way, Value::String(family));
-        }
-        let start = first_string(props, &["start_endpoint_key"]);
-        let end = first_string(props, &["end_endpoint_key"]);
-        if let Some(start) = &start {
-            endpoint_to_sections
-                .entry(start.clone())
-                .or_default()
-                .push(section_id.clone());
-        }
-        if let Some(end) = &end {
-            endpoint_to_sections
-                .entry(end.clone())
-                .or_default()
-                .push(section_id.clone());
-        }
-        endpoints.insert(
-            section_id,
-            json!({
-                "startEndpointKey": start,
-                "endEndpointKey": end,
-                "lengthMeters": null
-            }),
-        );
-    }
-
-    let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for section_ids in endpoint_to_sections.values() {
-        for left in section_ids {
-            for right in section_ids {
-                if left != right {
-                    adjacency
-                        .entry(left.clone())
-                        .or_default()
-                        .insert(right.clone());
-                }
-            }
-        }
-    }
-    let adjacency_json = adjacency
-        .into_iter()
-        .map(|(key, values)| {
-            (
-                key,
-                Value::Array(values.into_iter().map(Value::String).collect()),
-            )
-        })
-        .collect::<Map<_, _>>();
-    let junctions = endpoint_to_sections
-        .into_iter()
-        .filter(|(_, ids)| ids.len() > 1)
-        .map(|(endpoint, ids)| json!({"endpointKey": endpoint, "sectionIDs": ids, "kind": "junction"}))
-        .collect::<Vec<_>>();
-
-    json!({
-        "schemaVersion": RENDER_SCHEMA_VERSION,
-        "generatedAt": generated_at,
-        "sourceWayToFamilyKey": source_way_to_family,
-        "sectionEndpointByID": endpoints,
-        "sectionAdjacencyByID": adjacency_json,
-        "branchTopologyLinks": [],
-        "sharedSectionRoleByID": {},
-        "runStructures": [],
-        "junctions": junctions,
-        "liftAnchorsByLiftID": {}
-    })
-}
-
-fn empty_explore_detail(generated_at: DateTime<Utc>) -> Value {
-    json!({
-        "schemaVersion": RENDER_SCHEMA_VERSION,
-        "generatedAt": generated_at,
-        "processingConfiguration": {
-            "profileSampleSpacingMeters": 25.0,
-            "demAccuracyMeters": 30.0,
-            "smoothingMethod": "median_then_mean"
-        },
-        "runsBySelectionKey": {},
-        "liftsBySelectionKey": {}
-    })
-}
-
 fn app_render_manifest(
     resort: &ResortRecord,
     generated_at: DateTime<Utc>,
@@ -2202,9 +2073,7 @@ fn app_render_manifest(
             "connections": "connections.geojson",
             "connectionCenterlines": "connection_centerlines.geojson",
             "lifts": "lifts.geojson",
-            "liftStations": "lift_stations.geojson",
-            "runMatchingHints": "run_matching_hints.json",
-            "exploreDetail": "explore_detail.json"
+            "liftStations": "lift_stations.geojson"
         },
         "stats": {
             "downhillLineFeatureCount": run_count,
@@ -2614,54 +2483,6 @@ fn source_keys_from_properties(props: &Map<String, Value>) -> BTreeSet<String> {
     keys
 }
 
-fn collect_names(props: &Map<String, Value>, primary: &str) -> Vec<String> {
-    let mut names = BTreeSet::new();
-    names.insert(primary.to_string());
-    for key in [
-        "altName",
-        "alt_name",
-        "localName",
-        "loc_name",
-        "shortName",
-        "short_name",
-    ] {
-        if let Some(value) = props.get(key) {
-            collect_string_values(value, &mut names);
-        }
-    }
-    if let Some(localized) = props.get("localized").or_else(|| props.get("names")) {
-        collect_string_values(localized, &mut names);
-    }
-    names
-        .into_iter()
-        .filter(|name| !name.trim().is_empty())
-        .collect()
-}
-
-fn collect_string_values(value: &Value, names: &mut BTreeSet<String>) {
-    match value {
-        Value::String(text) => {
-            for part in text.split(';') {
-                let trimmed = part.trim();
-                if !trimmed.is_empty() {
-                    names.insert(trimmed.to_string());
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_string_values(item, names);
-            }
-        }
-        Value::Object(object) => {
-            for value in object.values() {
-                collect_string_values(value, names);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn has_any_value(props: &Map<String, Value>, keys: &[&str], needle: &str) -> bool {
     keys.iter()
         .filter_map(|key| props.get(*key))
@@ -3064,7 +2885,7 @@ fn file_metadata(layer: &str, path: &Path, source_url: Option<String>) -> Result
     }))
 }
 
-fn checksums_for_dir(path: &Path) -> Result<Value> {
+fn file_manifest_for_dir(path: &Path) -> Result<Value> {
     let mut files = Map::new();
     for entry in WalkDir::new(path).min_depth(1).max_depth(1) {
         let entry = entry?;
@@ -3075,7 +2896,7 @@ fn checksums_for_dir(path: &Path) -> Result<Value> {
         let Some(name) = file_path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name == "checksums.json" {
+        if name == "artifact_manifest.json" {
             continue;
         }
         let size = fs::metadata(file_path)?.len();
@@ -3581,6 +3402,33 @@ mod tests {
                 .exists()
         );
         validate_output(output.path())?;
+        let resorts_json: Value = read_json(&output.path().join("resorts.json"))?;
+        let first_resort = resorts_json
+            .get("resorts")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_object)
+            .expect("first resort object");
+        assert!(!first_resort.contains_key("names"));
+        assert!(!first_resort.contains_key("artifactManifestPath"));
+
+        let package_dir = output.path().join("packages/resorts/area-1");
+        assert!(package_dir.join("artifact_manifest.json").exists());
+        assert!(!package_dir.join("checksums.json").exists());
+        assert!(!package_dir.join("run_matching_hints.json").exists());
+        assert!(!package_dir.join("explore_detail.json").exists());
+
+        let manifest: Value = read_json(&package_dir.join("manifest.json"))?;
+        let files = manifest
+            .get("files")
+            .and_then(Value::as_object)
+            .expect("render manifest files");
+        assert!(!files.contains_key("runMatchingHints"));
+        assert!(!files.contains_key("exploreDetail"));
+
+        let local_render_bundle = output.path().join("local-app/render-bundles/area-1");
+        assert!(!local_render_bundle.join("run_matching_hints.json").exists());
+        assert!(!local_render_bundle.join("explore_detail.json").exists());
         assert!(output.path().join("release-packs/manifest.json").exists());
         Ok(())
     }
@@ -3663,7 +3511,6 @@ mod tests {
         ResortRecord {
             id: id.to_string(),
             name: name.to_string(),
-            names: vec![name.to_string()],
             resort_type: resort_type.to_string(),
             parent_id: parent_id.map(str::to_string),
             parent_name: parent_id.map(|_| "Domain".to_string()),
@@ -3674,7 +3521,6 @@ mod tests {
             country_codes: vec!["IT".to_string()],
             group_id: "IT-BZ".to_string(),
             center: [10.01, 46.01],
-            artifact_manifest_path: format!("packages/resorts/{id}/artifact_manifest.json"),
             child_ids: Vec::new(),
             run_convention: Some("europe".to_string()),
             places: Value::Null,
