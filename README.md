@@ -11,8 +11,15 @@ The authoritative upstream inputs are the OpenSkiMap GeoJSON layers at:
 - `https://tiles.openskimap.org/geojson/lifts.geojson`
 - `https://tiles.openskimap.org/geojson/ski_areas.geojson`
 - `https://tiles.openskimap.org/geojson/runs.geojson`
+- `https://tiles.openskimap.org/geojson/spots.geojson`
 
 The CLI caches these files under `data/raw/openskimap/<dataset-version>/` by default. Treat the cache as the normal development path: fetch once for a dataset version, then rebuild and validate from the local files.
+
+Connection features are cached as an enrichment layer at:
+
+- `data/raw/openskimap/<dataset-version>/connections.geojson`
+
+OpenSkiMap GeoJSON is checked first. When OpenSkiMap contains connection features, they are identified by `properties.type = "connection"` and copied into `connections.geojson`. When OpenSkiMap does not yet contain those features, `fetch` uses a narrow Overpass fallback for raw OSM `piste:type=connection` ways and relations. The default Overpass base URL is `https://overpass-api.de/api/`, and requests use the SkiNavIndexes user agent configured in the CLI. Overpass is only used by `fetch`; `build` and `all --skip-fetch` never query the network.
 
 ## Commands
 
@@ -66,18 +73,21 @@ cargo run --release -- build --cache-dir data/raw/openskimap --output-dir output
 
 # Point at a compatible OpenSkiMap GeoJSON base URL.
 cargo run --release -- fetch --source-base-url https://tiles.openskimap.org/geojson
+
+# Point connection enrichment at a different Overpass API base URL.
+cargo run --release -- fetch --overpass-base-url https://overpass-api.de/api/
 ```
 
 ## One-Download Cache Policy
 
 The intended workflow is:
 
-1. Run `cargo run --release -- fetch --dataset-version <version>` once for the dataset version.
+1. Run `cargo run --release -- fetch --dataset-version <version>` once for the dataset version. This downloads missing OpenSkiMap layers, including `spots.geojson`, and creates `connections.geojson` from OpenSkiMap `type=connection` features or the Overpass fallback.
 2. Re-run `cargo run --release -- build --dataset-version <version>` as often as needed.
 3. Re-run `cargo run --release -- validate` after builds.
 4. Use `cargo run --release -- all --dataset-version <version> --skip-fetch` when you want the full local build and validation path without touching the network.
 
-Do not delete `data/raw/openskimap/<dataset-version>/` just to force a rebuild. Delete or replace cached source files only when intentionally moving to a new upstream snapshot.
+Do not delete `data/raw/openskimap/<dataset-version>/` just to force a rebuild. Delete or replace cached source files only when intentionally moving to a new upstream snapshot. If `spots.geojson` or `connections.geojson` is missing, run `fetch` for that dataset version before building; the build step will fail rather than silently changing the source contract or querying Overpass.
 
 ## Output Layout
 
@@ -94,25 +104,18 @@ output/
 │           ├── manifest.json
 │           ├── artifact_manifest.json
 │           ├── lifts.geojson
-│           ├── lift_stations.geojson
 │           ├── downhill_lines.geojson
 │           ├── downhill_polygons.geojson
 │           ├── downhill_centerlines.geojson
-│           ├── run_matching_hints.json
-│           ├── explore_detail.json
-│           ├── audit_report.json
-│           └── checksums.json
+│           ├── connections.geojson
+│           ├── connection_sections.geojson
+│           ├── spots.geojson
+│           └── audit_report.json
 ├── groups/
 │   └── <group>.tar.gz
 ├── release-packs/
 │   ├── manifest.json
 │   └── <balanced-pack>.tar.gz
-└── local-app/
-    ├── resorts.json
-    ├── latest.json
-    ├── manifest.json
-    ├── graphs/
-    └── render-bundles/
 ```
 
 Key files:
@@ -120,13 +123,18 @@ Key files:
 - `latest.json` at the repository root is the stable app entrypoint. It is tracked and should point at the current published `resorts.json` release asset.
 - `output/resorts.json` is the backward-compatible discovery index consumed by the current SkiNav app.
 - `output/latest.json` is the generated release-candidate metadata for the build output.
-- `output/build-report.json` records dataset version, generated timestamp, source counts, and warnings.
+- `output/build-report.json` records dataset version, generated timestamp, source counts, assigned spot counts, and warnings.
 - `output/packages/resorts/<id>/...` contains the per-resort files used for richer offline graph and render workflows. Leaf resort packages own render artifacts; domain packages are lightweight metadata packages that reference child resort artifacts instead of duplicating child runs and lifts.
 - `output/groups/<group>.tar.gz` bundles resort packages by logical ISO-derived group for debugging and inspection.
 - `output/release-packs/...` is the release distribution layout. Large logical groups are split into part archives and tiny groups are combined into balanced packs. `output/release-packs/manifest.json` maps every release asset back to group and resort IDs.
-- `output/local-app/...` is the local seeding surface for device and simulator validation. It includes `resorts.json`, `latest.json`, `manifest.json`, `render-bundles/<resort-id>/...`, and `graphs/*.graph.meta.json`.
 
-The pipeline intentionally does not generate `rendering_features.geojson`: that file duplicated `downhill_lines.geojson`, `downhill_polygons.geojson`, and `lifts.geojson`, and SkiNav does not consume it. Per-resort raw `runs.geojson` is also omitted because the cached OpenSkiMap source snapshot is the canonical raw input and SkiNav local artifacts do not read package raw-run files.
+Per-resort run artifacts are sanitized app-renderable exports, not raw OpenSkiMap copies. `downhill_lines.geojson` and `downhill_centerlines.geojson` include `downhill` and `snow_park` line features; `downhill_polygons.geojson` includes `downhill`, `snow_park`, and `playground` polygon features. The observed `nordic`, `hike`, `fatbike`, `sleigh`, `ice_skate`, `sled`, and `skitour` uses are intentionally excluded from app artifacts until routing and rendering policy exists for them.
+
+Run line and section artifacts preserve OpenSkiMap 3D coordinates and `elevationProfile` values (`heights`, `resolution`, and `targetResolution`) when present. Assignment-only source properties (`skiAreas`, `skiAreaIds`, `ski_area_ids`, and `ski_area`) are pruned from final app artifacts, including nested lift stations and spots; resort membership remains represented by package path and manifests.
+
+Lift station records are embedded in `lifts.geojson` via sanitized `properties.stations`; standalone `lift_stations.geojson` is no longer part of the runtime artifact contract. `spots.geojson` contains all assigned OpenSkiMap spots. Crossing spots preserve `spotType = "crossing"` and `dismount = "yes" | "sometimes" | "no"` so SkiNav can render road-crossing policy without another source-contract change.
+
+The pipeline intentionally does not generate `rendering_features.geojson` or `output/local-app`: those duplicate per-layer export artifacts that already live inside resort packages and release packs.
 
 ## GitHub Workflow
 
@@ -141,7 +149,7 @@ Pull requests run Rust smoke checks only: build, tests, and CLI help. Manual dis
 5. Upload generated index artifacts and balanced release-pack artifacts.
 6. Optionally create or update a GitHub release when `publish_release` is enabled.
 
-The public release contract is `latest.json`, `resorts.json`, `build-report.json`, `release-pack-manifest.json`, and the tarballs named in that manifest. `output/local-app` is intentionally not uploaded as a release asset; it is a local simulator/device seeding layout and duplicates files already represented in resort packages.
+The public release contract is `latest.json`, `resorts.json`, `build-report.json`, `release-pack-manifest.json`, and the tarballs named in that manifest.
 
 For a dry run from a pushed branch:
 
