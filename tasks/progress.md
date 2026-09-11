@@ -16,14 +16,38 @@
 
 ## Current Metrics
 
-- Resorts: 4,494
-- Domain records: 79
-- Runs: 96,152
-- Lifts: 23,690
-- Assigned connections: 2,639
-- Group archives: 627
-- Generated output: 1.6 GB
-- Source cache: 1.0 GB
+- Resorts: 4,523
+- Runs: 98,275
+- Lifts: 23,771
+- Assigned connections: 2,734
+- Spots: 28,996
+- Source packs: 10
+- Generated output: root-level SQLite assets only
+
+## 2026-09-10
+
+- Completed the SQLite index cutover as the only generated output contract.
+- Removed normalized leaf-only ownership filtering: parent/domain IDs can directly own runs, lifts, spots, and connections.
+- Added fail-fast normalized hierarchy/ownership validation for duplicate IDs, missing parents/owners, cycles, and derived child relationships.
+- Added a Domain D / Child A / Child B regression proving a parent-only run, spot, and connection survive normalization and package output.
+- Added root-level `output/latest.json`, `catalog.sqlite.gz`, and gzip-compressed `pack-*.sqlite.gz` source assets.
+- The canonical catalog stores `metadata`, `resorts`, `resort_iso_codes`, `packs`, `resort_packs`, and `resort_source_stats`; source packs store normalized feature tables and ownership joins.
+- Generation and `validate` verify SQLite quick/integrity/foreign-key checks, compressed asset hashes/metadata, catalog hierarchy, join completeness, and expected logical feature/ownership sets against all physical packs.
+- Removed the V1 discovery JSON, package/group/release-pack generation, and nested `output/v2` candidate path.
+
+## 2026-09-10 - Canonical output verification
+
+- Rebuilt the cached `2026-09-10` dataset into the root `output/` directory; it contains only `latest.json`, `catalog.sqlite.gz`, and 10 `pack-*.sqlite.gz` source assets.
+- `cargo fmt -- --check && cargo test`, `cargo run --release -- validate`, and the full cached build all passed. No V1 discovery JSON, package tree, group archive, release-pack archive, or nested V2 output is generated.
+
+## 2026-09-10 - SQLite payload compaction and workflow verification
+
+- Removed redundant `skiAreas`, `skiAreaIds`, `ski_area_ids`, and `ski_area` assignment properties from source-pack `properties_json`; resort ownership remains fully represented by the normalized join tables.
+- Corrected pack planning to estimate the compact payload instead of the removed assignment properties, recursively pruned nested assignment keys, then tuned the target from 24 MiB to 28 MiB. The validated output is 10 packs totaling 102,329,704 compressed bytes / 364,589,056 uncompressed bytes including the catalog; the largest pack is 11.6 MB compressed and the smallest is 5.4 MB.
+- Measured sequential local gzip decompression of all final assets at 0.29–0.30 seconds. The compressed release saves 262,259,352 bytes, so downloading compressed assets remains faster than downloading SQLite files uncompressed at normal network speeds.
+- Audited the final 10-pack layout: 4.0% of serialized feature-row payload is repeated across pack boundaries (8,905,140 of 223,487,919 bytes); that duplication remains intentional for independently downloadable packs, while ownership joins preserve every logical ownership pair.
+- Added a manual `publish_release` switch to the workflow so a pushed branch can run the complete fetch/build/validate path without creating or updating a GitHub Release. Release upload now targets only the canonical assets and removes stale assets when updating a tag.
+- Ran the exact local workflow path with `cargo run --release --locked -- all --skip-fetch`; the cached dataset built and validated successfully. The GitHub dry run remains pending until these uncommitted V2 workflow changes are pushed; remote `main` still exposes the old V1 workflow.
 
 ## 2026-06-04
 
@@ -54,8 +78,7 @@
 ## Known Follow-Up Work
 
 - Peak Rust build RSS is still high because the first implementation keeps normalized run/lift geometry in memory while writing packages.
-- The current client consumes remote `latest.json` and `resorts.json`; per-resort release artifact downloading is future work.
-- Archive grouping should be revisited because some group archives are much larger than others.
+- The client now consumes remote `latest.json` and `catalog.sqlite.gz`; source-pack download and app-owned render/graph artifact lifecycle remain separate concerns.
 
 ## 2026-06-07
 

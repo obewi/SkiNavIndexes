@@ -9,6 +9,11 @@ on:
         description: "Dataset version. Defaults to current UTC date."
         required: false
         type: string
+      publish_release:
+        description: "Publish the generated assets as a GitHub Release."
+        required: false
+        default: false
+        type: boolean
   pull_request:
     paths:
       - ".github/workflows/release-indexes.yml"
@@ -74,8 +79,10 @@ jobs:
           if [ -z "$dataset_version" ]; then
             dataset_version="$(date -u +%F)"
           fi
+          publish_release="${{ github.event_name == 'schedule' || inputs.publish_release }}"
           echo "dataset_version=${dataset_version}" >> "$GITHUB_OUTPUT"
           echo "release_tag=indexes-${dataset_version}" >> "$GITHUB_OUTPUT"
+          echo "publish_release=${publish_release}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
@@ -89,39 +96,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          hash="$(sha256sum output/resorts.json | cut -d' ' -f1)"
-          size="$(wc -c < output/resorts.json | tr -d ' ')"
-          count="$(python -c 'import json; print(json.load(open("output/resorts.json"))["total_resorts"])')"
+          hash="$(sha256sum output/catalog.sqlite.gz | cut -d' ' -f1)"
+          size="$(wc -c < output/catalog.sqlite.gz | tr -d ' ')"
+          pack_count="$(find output -maxdepth 1 -type f -name 'pack-*.sqlite.gz' | wc -l | tr -d ' ')"
           timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           echo "hash=${hash}" >> "$GITHUB_OUTPUT"
           echo "size=${size}" >> "$GITHUB_OUTPUT"
-          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "pack_count=${pack_count}" >> "$GITHUB_OUTPUT"
           echo "timestamp=${timestamp}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release assets
+        if: steps.settings.outputs.publish_release == 'true'
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.settings.outputs.dataset_version }}"
           mkdir -p release/index
           cp output/latest.json release/index/latest.json
-          cp output/resorts.json release/index/resorts.json
-          cp output/build-report.json release/index/build-report.json
-          cp output/release-packs/manifest.json release/index/release-pack-manifest.json
+          cp output/catalog.sqlite.gz release/index/catalog.sqlite.gz
+          cp output/pack-*.sqlite.gz release/index/
           {
             echo "# SkiNavIndexes ${version}"
             echo
             echo "Generated from OpenSkiMap GeoJSON on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
             echo
-            echo "- Total resorts: ${{ steps.metadata.outputs.count }}"
-            echo "- SHA256: ${{ steps.metadata.outputs.hash }}"
-            echo "- Discovery index: resorts.json"
-            echo "- Release pack manifest: release-pack-manifest.json"
-            echo "- Release packs: balanced output/release-packs/*.tar.gz assets"
+            echo "- Catalog: catalog.sqlite.gz"
+            echo "- Catalog compressed bytes: ${{ steps.metadata.outputs.size }}"
+            echo "- Catalog SHA256: ${{ steps.metadata.outputs.hash }}"
+            echo "- Source packs: ${{ steps.metadata.outputs.pack_count }} pack-*.sqlite.gz assets"
           } > release/RELEASE_NOTES.md
 
       - name: Publish GitHub release
+        if: steps.settings.outputs.publish_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -130,28 +137,30 @@ jobs:
           tag="${{ steps.settings.outputs.release_tag }}"
           title="SkiNavIndexes ${{ steps.settings.outputs.dataset_version }}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            for stale_asset in \
-              "group-manifest.json" \
-              "local-app-manifest.json" \
-              "skinavindexes-groups-${{ steps.settings.outputs.dataset_version }}.tar.gz" \
-              "skinavindexes-local-app-${{ steps.settings.outputs.dataset_version }}.tar.gz"
-            do
-              gh release delete-asset "$tag" "$stale_asset" --yes >/dev/null 2>&1 || true
-            done
-            for stale_group_asset in $(gh release view "$tag" --json assets --jq '.assets[].name | select(test("^(small-groups-|[A-Z0-9]{2}[-_A-Z0-9]*).*\\.tar\\.gz$"))'); do
-              gh release delete-asset "$tag" "$stale_group_asset" --yes >/dev/null 2>&1 || true
-            done
-            gh release upload "$tag" release/index/* output/release-packs/*.tar.gz --clobber
+            expected_assets="$(find release/index -maxdepth 1 -type f -printf '%f\n' | sort)"
+            while IFS= read -r existing_asset; do
+              if ! grep -Fqx "$existing_asset" <<< "$expected_assets"; then
+                gh release delete-asset "$tag" "$existing_asset" --yes >/dev/null 2>&1 || true
+              fi
+            done < <(gh release view "$tag" --json assets --jq '.assets[].name')
+            gh release upload "$tag" \
+              release/index/latest.json \
+              release/index/catalog.sqlite.gz \
+              release/index/pack-*.sqlite.gz \
+              --clobber
             gh release edit "$tag" --title "$title" --notes-file release/RELEASE_NOTES.md --target "$GITHUB_SHA"
           else
-            gh release create "$tag" release/index/* output/release-packs/*.tar.gz \
+            gh release create "$tag" \
+              release/index/latest.json \
+              release/index/catalog.sqlite.gz \
+              release/index/pack-*.sqlite.gz \
               --title "$title" \
               --notes-file release/RELEASE_NOTES.md \
               --target "$GITHUB_SHA"
           fi
 
       - name: Update root latest.json entrypoint
-        if: github.ref_name == github.event.repository.default_branch
+        if: github.ref_name == github.event.repository.default_branch && steps.settings.outputs.publish_release == 'true'
         shell: bash
         run: |
           set -euo pipefail

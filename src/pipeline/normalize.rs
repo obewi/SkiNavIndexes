@@ -35,7 +35,7 @@ pub(super) fn normalize_sources(
         let iso_codes = iso_codes_from_places(feature.properties.get("places"));
         let country_codes = country_codes_from_places(feature.properties.get("places"));
         let country = country_codes.first().cloned();
-        let group_id = iso_codes
+        let pack_group_hint = iso_codes
             .first()
             .cloned()
             .or_else(|| country.clone())
@@ -44,28 +44,14 @@ pub(super) fn normalize_sources(
         resorts.push(ResortRecord {
             id: id.clone(),
             name,
-            resort_type: "resort".to_string(),
             parent_id: None,
-            parent_name: None,
             bbox,
             area_km2: area_km2_from_bbox(bbox),
             country,
             iso_codes,
-            country_codes,
-            group_id,
+            pack_group_hint,
             center,
-            child_ids: Vec::new(),
             run_convention: first_string(&feature.properties, &["runConvention", "run_convention"]),
-            places: feature
-                .properties
-                .get("places")
-                .cloned()
-                .unwrap_or(Value::Null),
-            statistics: feature
-                .properties
-                .get("statistics")
-                .cloned()
-                .unwrap_or(Value::Null),
         });
     }
 
@@ -172,20 +158,20 @@ pub(super) fn normalize_sources(
 
     apply_feature_bounds_to_resorts(&mut resorts, &normalized_runs, &normalized_lifts);
     compute_resort_hierarchy(&mut resorts, &normalized_runs, &normalized_lifts);
-    let normalized_connections = assign_connections_to_leaf_resorts(
+    let normalized_connections = assign_connections_to_resorts(
         connection_candidates,
         &resorts,
         &normalized_runs,
         &normalized_lifts,
         &mut warnings,
     );
-    let normalized_spots = assign_spots_to_leaf_resorts(spot_candidates, &resorts, &mut warnings);
+    let normalized_spots = assign_spots_to_resorts(spot_candidates, &resorts, &mut warnings);
 
     if resorts.is_empty() {
         bail!("no operating downhill resorts found; check OpenSkiMap schema and source files");
     }
 
-    Ok(NormalizedDataset {
+    let dataset = NormalizedDataset {
         dataset_version: dataset_version.to_string(),
         generated_at,
         resorts,
@@ -193,8 +179,88 @@ pub(super) fn normalize_sources(
         lifts: normalized_lifts,
         spots: normalized_spots,
         connections: normalized_connections,
-        warnings,
-    })
+    };
+    validate_normalized_dataset(&dataset)?;
+    Ok(dataset)
+}
+
+pub(super) fn validate_normalized_dataset(dataset: &NormalizedDataset) -> Result<()> {
+    let mut resort_ids = BTreeSet::new();
+    for resort in &dataset.resorts {
+        if !resort_ids.insert(resort.id.as_str()) {
+            bail!("duplicate resort id {}", resort.id);
+        }
+    }
+
+    for resort in &dataset.resorts {
+        if let Some(parent_id) = resort.parent_id.as_deref() {
+            if parent_id == resort.id {
+                bail!("resort {} cannot be its own parent", resort.id);
+            }
+            if !resort_ids.contains(parent_id) {
+                bail!(
+                    "resort {} references missing parent {}",
+                    resort.id,
+                    parent_id
+                );
+            }
+        }
+    }
+
+    for resort in &dataset.resorts {
+        let mut path = BTreeSet::new();
+        let mut current = Some(resort.id.as_str());
+        while let Some(id) = current {
+            if !path.insert(id) {
+                bail!("resort hierarchy contains a cycle at {}", id);
+            }
+            current = dataset
+                .resorts
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .and_then(|candidate| candidate.parent_id.as_deref());
+        }
+    }
+
+    validate_feature_ownership("run", &dataset.runs, &resort_ids)?;
+    validate_feature_ownership("lift", &dataset.lifts, &resort_ids)?;
+    validate_feature_ownership("spot", &dataset.spots, &resort_ids)?;
+    validate_feature_ownership("connection", &dataset.connections, &resort_ids)?;
+    Ok(())
+}
+
+fn validate_feature_ownership(
+    feature_kind: &str,
+    records: &[FeatureRecord],
+    resort_ids: &BTreeSet<&str>,
+) -> Result<()> {
+    let mut feature_ids = BTreeSet::new();
+    for record in records {
+        if !feature_ids.insert(record.id.as_str()) {
+            bail!("duplicate {feature_kind} id {}", record.id);
+        }
+        if record.resort_ids.is_empty() {
+            bail!("{feature_kind} {} has no resort owner", record.id);
+        }
+        let mut previous = None;
+        for resort_id in &record.resort_ids {
+            if !resort_ids.contains(resort_id.as_str()) {
+                bail!(
+                    "{feature_kind} {} references missing resort {}",
+                    record.id,
+                    resort_id
+                );
+            }
+            if previous.is_some_and(|previous| previous >= resort_id.as_str()) {
+                bail!(
+                    "{feature_kind} {} has unsorted or duplicate resort ownership",
+                    record.id
+                );
+            }
+            previous = Some(resort_id.as_str());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn apply_feature_bounds_to_resorts(
@@ -233,6 +299,10 @@ pub(super) fn compute_resort_hierarchy(
     runs: &[FeatureRecord],
     lifts: &[FeatureRecord],
 ) {
+    for resort in resorts.iter_mut() {
+        resort.parent_id = None;
+    }
+
     let mut graph: HashMap<String, BTreeSet<String>> = HashMap::new();
     for record in runs.iter().chain(lifts.iter()) {
         for left in &record.resort_ids {
@@ -283,44 +353,33 @@ pub(super) fn compute_resort_hierarchy(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         let parent_id = component[0].clone();
-        let parent_name = resort_index
-            .get(&parent_id)
-            .map(|i| resorts[*i].name.clone())
-            .unwrap_or_else(|| parent_id.clone());
-        let child_ids = component.iter().skip(1).cloned().collect::<Vec<_>>();
-        if let Some(parent_index) = resort_index.get(&parent_id).copied() {
-            resorts[parent_index].resort_type = "domain".to_string();
-            resorts[parent_index].child_ids = child_ids.clone();
-        }
-        for child_id in child_ids {
-            if let Some(child_index) = resort_index.get(&child_id).copied() {
+        for child_id in component.iter().skip(1) {
+            if let Some(child_index) = resort_index.get(child_id).copied() {
                 resorts[child_index].parent_id = Some(parent_id.clone());
-                resorts[child_index].parent_name = Some(parent_name.clone());
             }
         }
     }
 }
 
-pub(super) fn assign_connections_to_leaf_resorts(
+pub(super) fn assign_connections_to_resorts(
     connections: Vec<FeatureRecord>,
     resorts: &[ResortRecord],
     runs: &[FeatureRecord],
     lifts: &[FeatureRecord],
     warnings: &mut Vec<String>,
 ) -> Vec<FeatureRecord> {
-    let leaf_resort_ids = resorts
+    let resort_ids = resorts
         .iter()
-        .filter(|resort| resort.resort_type != "domain")
         .map(|resort| resort.id.clone())
         .collect::<BTreeSet<_>>();
-    let source_index = source_resort_index(runs, lifts, &leaf_resort_ids);
-    let network_index = build_network_match_index(runs, lifts, &leaf_resort_ids);
+    let source_index = source_resort_index(runs, lifts, &resort_ids);
+    let network_index = build_network_match_index(runs, lifts, &resort_ids);
     let mut assigned = Vec::new();
 
     for mut connection in connections {
         let mut resort_ids = ski_area_ids(&connection.properties)
             .into_iter()
-            .filter(|id| leaf_resort_ids.contains(id))
+            .filter(|id| resort_ids.contains(id))
             .collect::<BTreeSet<_>>();
 
         if resort_ids.is_empty() {
@@ -349,16 +408,12 @@ pub(super) fn assign_connections_to_leaf_resorts(
     assigned
 }
 
-pub(super) fn assign_spots_to_leaf_resorts(
+pub(super) fn assign_spots_to_resorts(
     spots: Vec<FeatureRecord>,
     resorts: &[ResortRecord],
     warnings: &mut Vec<String>,
 ) -> Vec<FeatureRecord> {
-    let leaf_resorts = resorts
-        .iter()
-        .filter(|resort| resort.resort_type != "domain")
-        .collect::<Vec<_>>();
-    let leaf_resort_ids = leaf_resorts
+    let resort_ids = resorts
         .iter()
         .map(|resort| resort.id.clone())
         .collect::<BTreeSet<_>>();
@@ -367,13 +422,13 @@ pub(super) fn assign_spots_to_leaf_resorts(
     for mut spot in spots {
         let mut resort_ids = ski_area_ids(&spot.properties)
             .into_iter()
-            .filter(|id| leaf_resort_ids.contains(id))
+            .filter(|id| resort_ids.contains(id))
             .collect::<BTreeSet<_>>();
 
         if resort_ids.is_empty() {
             if let Some(point) = point_geometry_lon_lat(&spot.geometry) {
                 resort_ids.extend(
-                    leaf_resorts
+                    resorts
                         .iter()
                         .filter(|resort| {
                             point_in_bbox(point, padded_bbox_meters(resort.bbox, 150.0))
@@ -429,14 +484,14 @@ pub(super) fn point_in_bbox(point: [f64; 2], bbox: [f64; 4]) -> bool {
 pub(super) fn source_resort_index(
     runs: &[FeatureRecord],
     lifts: &[FeatureRecord],
-    leaf_resort_ids: &BTreeSet<String>,
+    resort_ids: &BTreeSet<String>,
 ) -> HashMap<String, BTreeSet<String>> {
     let mut index: HashMap<String, BTreeSet<String>> = HashMap::new();
     for record in runs.iter().chain(lifts.iter()) {
         let resort_ids = record
             .resort_ids
             .iter()
-            .filter(|id| leaf_resort_ids.contains(*id))
+            .filter(|id| resort_ids.contains(*id))
             .cloned()
             .collect::<BTreeSet<_>>();
         if resort_ids.is_empty() {
@@ -469,7 +524,7 @@ pub(super) struct NetworkMatchIndex {
 pub(super) fn build_network_match_index(
     runs: &[FeatureRecord],
     lifts: &[FeatureRecord],
-    leaf_resort_ids: &BTreeSet<String>,
+    resort_ids: &BTreeSet<String>,
 ) -> NetworkMatchIndex {
     let features = runs
         .iter()
@@ -478,7 +533,7 @@ pub(super) fn build_network_match_index(
             let resort_ids = record
                 .resort_ids
                 .iter()
-                .filter(|id| leaf_resort_ids.contains(*id))
+                .filter(|id| resort_ids.contains(*id))
                 .cloned()
                 .collect::<Vec<_>>();
             if resort_ids.is_empty() {

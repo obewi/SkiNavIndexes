@@ -28,7 +28,7 @@ pub(crate) enum Command {
         #[arg(long)]
         skip_connection_enrichment: bool,
     },
-    /// Build indexes, packages, group archives, and release-pack artifacts from cached source files.
+    /// Build the canonical SQLite catalog and source packs from cached source files.
     Build {
         #[arg(long, default_value = "data/raw/openskimap")]
         cache_dir: PathBuf,

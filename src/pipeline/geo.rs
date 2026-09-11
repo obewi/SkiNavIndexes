@@ -250,13 +250,6 @@ pub(super) fn geometry_type(geometry: &Value) -> Option<&str> {
     geometry.get("type").and_then(Value::as_str)
 }
 
-pub(super) fn endpoint_key_from_coord_value(value: &Value) -> Option<String> {
-    let items = value.as_array()?;
-    let lon = items.first()?.as_f64()?;
-    let lat = items.get(1)?.as_f64()?;
-    Some(format!("{lat:.6},{lon:.6}"))
-}
-
 pub(super) fn first_string(props: &Map<String, Value>, keys: &[&str]) -> Option<String> {
     keys.iter()
         .filter_map(|key| props.get(*key))
@@ -279,71 +272,4 @@ pub(super) fn explicit_non_operating_status(status: &str) -> bool {
             status.to_ascii_lowercase().as_str(),
             "operating" | "open" | "active"
         )
-}
-
-pub(super) fn opt_string_value(value: Option<String>) -> Value {
-    value.map(Value::String).unwrap_or(Value::Null)
-}
-
-pub(super) fn safe_path_id(id: &str) -> String {
-    id.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-pub(super) fn feature_count(collection: &Value) -> usize {
-    collection
-        .get("features")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0)
-}
-
-pub(super) fn count_section_direction(
-    collection: &Value,
-    direction_source: &str,
-    effective_oneway: bool,
-) -> usize {
-    collection
-        .get("features")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|feature| {
-            let Some(properties) = feature.get("properties").and_then(Value::as_object) else {
-                return false;
-            };
-            properties
-                .get("direction_source")
-                .and_then(Value::as_str)
-                .is_some_and(|source| source == direction_source)
-                && properties
-                    .get("effective_oneway")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|oneway| oneway == effective_oneway)
-        })
-        .count()
-}
-
-pub(super) fn count_unknown_direction_sections(collection: &Value) -> usize {
-    collection
-        .get("features")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|feature| {
-            feature
-                .get("properties")
-                .and_then(Value::as_object)
-                .and_then(|properties| properties.get("direction_source"))
-                .and_then(Value::as_str)
-                == Some("none")
-        })
-        .count()
 }

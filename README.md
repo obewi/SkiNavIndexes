@@ -1,8 +1,8 @@
 # SkiNav Indexes
 
-Rust CLI for building SkiNav discovery indexes and offline resort artifacts from cached OpenSkiMap GeoJSON snapshots.
+Rust CLI for building the SkiNav SQLite catalog and compressed source packs from cached OpenSkiMap GeoJSON snapshots.
 
-The current pipeline is intentionally source-specific: it consumes OpenSkiMap GeoJSON layer files, builds backward-compatible discovery output for SkiNav.
+The pipeline consumes OpenSkiMap GeoJSON layer files and emits one canonical SQLite release for SkiNav. The generated release root is the only client-facing output contract.
 
 ## Data Source
 
@@ -95,46 +95,22 @@ Generated artifacts are written below `output/` by default:
 
 ```text
 output/
-├── resorts.json
 ├── latest.json
-├── build-report.json
-├── packages/
-│   └── resorts/
-│       └── <resort-id>/
-│           ├── manifest.json
-│           ├── artifact_manifest.json
-│           ├── lifts.geojson
-│           ├── downhill_lines.geojson
-│           ├── downhill_polygons.geojson
-│           ├── downhill_centerlines.geojson
-│           ├── connections.geojson
-│           ├── connection_sections.geojson
-│           ├── spots.geojson
-│           └── audit_report.json
-├── groups/
-│   └── <group>.tar.gz
-├── release-packs/
-│   ├── manifest.json
-│   └── <balanced-pack>.tar.gz
+├── catalog.sqlite.gz
+└── pack-<number>.sqlite.gz
 ```
 
 Key files:
 
-- `latest.json` at the repository root is the stable app entrypoint. It is tracked and should point at the current published `resorts.json` release asset.
-- `output/resorts.json` is the backward-compatible discovery index consumed by the current SkiNav app.
-- `output/latest.json` is the generated release-candidate metadata for the build output.
-- `output/build-report.json` records dataset version, generated timestamp, source counts, assigned spot counts, and warnings.
-- `output/packages/resorts/<id>/...` contains the per-resort files used for richer offline graph and render workflows. Leaf resort packages own render artifacts; domain packages are lightweight metadata packages that reference child resort artifacts instead of duplicating child runs and lifts.
-- `output/groups/<group>.tar.gz` bundles resort packages by logical ISO-derived group for debugging and inspection.
-- `output/release-packs/...` is the release distribution layout. Large logical groups are split into part archives and tiny groups are combined into balanced packs. `output/release-packs/manifest.json` maps every release asset back to group and resort IDs.
+- `latest.json` is the stable app entrypoint. It identifies the schema, dataset, and verified `catalog.sqlite.gz` metadata.
+- `catalog.sqlite.gz` contains resort hierarchy, names, ISO metadata, source-pack references, and per-resort source statistics.
+- `pack-*.sqlite.gz` contains normalized source feature tables and explicit ownership join tables. A resort can reference more than one pack, and a feature can be owned by more than one resort.
 
-Per-resort run artifacts are sanitized app-renderable exports, not raw OpenSkiMap copies. `downhill_lines.geojson` and `downhill_centerlines.geojson` include `downhill` and `snow_park` line features; `downhill_polygons.geojson` includes `downhill`, `snow_park`, and `playground` polygon features. The observed `nordic`, `hike`, `fatbike`, `sleigh`, `ice_skate`, `sled`, and `skitour` uses are intentionally excluded from app artifacts until routing and rendering policy exists for them.
+There is no generated discovery JSON, per-resort package tree, group archive, release-pack tarball, or nested `output/v2/` candidate. `latest.json` is metadata only; resort search and future catalog statistics come from SQLite.
 
-Run line and section artifacts preserve OpenSkiMap 3D coordinates and `elevationProfile` values (`heights`, `resolution`, and `targetResolution`) when present. Assignment-only source properties (`skiAreas`, `skiAreaIds`, `ski_area_ids`, and `ski_area`) are pruned from final app artifacts, including nested lift stations and spots; resort membership remains represented by package path and manifests.
+The catalog tables are `metadata`, `resorts`, `resort_iso_codes`, `packs`, `resort_packs`, and `resort_source_stats`. Source packs contain `runs`, `lifts`, `spots`, and `connections` plus explicit ownership join tables. Geometry is stored as little-endian WKB, elevation profiles as little-endian `f64` sequences, and normalized feature properties remain available as row-level JSON for future app features. Redundant resort-assignment properties are omitted because ownership is stored in the join tables.
 
-Lift station records are embedded in `lifts.geojson` via sanitized `properties.stations`; standalone `lift_stations.geojson` is no longer part of the runtime artifact contract. `spots.geojson` contains all assigned OpenSkiMap spots. Crossing spots preserve `spotType = "crossing"` and `dismount = "yes" | "sometimes" | "no"` so SkiNav can render road-crossing policy without another source-contract change.
-
-The pipeline intentionally does not generate `rendering_features.geojson` or `output/local-app`: those duplicate per-layer export artifacts that already live inside resort packages and release packs.
+The pipeline intentionally does not generate app-owned render bundles or local simulator artifacts. SkiNav installs source packs from this release and creates its own render/graph artifacts locally.
 
 ## GitHub Workflow
 
@@ -143,19 +119,31 @@ The pipeline intentionally does not generate `rendering_features.geojson` or `ou
 Pull requests run Rust smoke checks only: build, tests, and CLI help. Manual dispatch runs the real release path:
 
 1. Resolve the dataset version, defaulting to the current UTC date.
-2. Restore Cargo and `data/raw/openskimap/<dataset-version>/` caches when available.
-3. Fetch missing OpenSkiMap source layers once for that dataset version.
-4. Build and validate the generated output.
-5. Upload generated index artifacts and balanced release-pack artifacts.
-6. Optionally create or update a GitHub release when `publish_release` is enabled.
+2. Fetch the OpenSkiMap source layers for that dataset version on the ephemeral runner.
+3. Build and validate the generated output.
+4. When `publish_release` is enabled, upload the canonical SQLite catalog and source-pack assets.
+5. When `publish_release` is enabled, create or update the dataset's GitHub release.
 
-The public release contract is `latest.json`, `resorts.json`, `build-report.json`, `release-pack-manifest.json`, and the tarballs named in that manifest.
+The workflow does not use `actions/cache` or `actions/upload-artifact`; generated data is deleted in the final cleanup step. GitHub still retains workflow logs and run metadata according to the repository's Actions retention settings, and the published release assets are intentionally stored as GitHub Release assets for SkiNav to download.
+
+The public release contract is the root-level `latest.json`, `catalog.sqlite.gz`, and `pack-*.sqlite.gz` assets.
+
+The build writes that release contract directly under `output/`:
+
+```text
+output/
+├── latest.json
+├── catalog.sqlite.gz
+└── pack-<number>.sqlite.gz
+```
+
+The catalog contains hierarchy, ISO metadata, pack references, and per-resort source statistics. Each compressed source pack contains normalized feature tables and ownership join tables. There is no V1 discovery index or archive-generation step.
 
 For a dry run from a pushed branch:
 
 ```bash
 gh workflow run release-indexes.yml \
-  --ref feature/geojson-rust-indexes \
+  --ref <pushed-branch> \
   -f dataset_version=2026-06-03 \
   -f publish_release=false
 ```
@@ -166,8 +154,7 @@ For a release:
 gh workflow run release-indexes.yml \
   --ref main \
   -f dataset_version=2026-06-03 \
-  -f publish_release=true \
-  -f release_tag=indexes-2026-06-03
+  -f publish_release=true
 ```
 
 ## Development Checks

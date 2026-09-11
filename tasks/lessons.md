@@ -1,5 +1,9 @@
 # Lessons
 
+## 2026-09-10
+
+- A format migration is incomplete while the old producer or consumer remains reachable. When SQLite becomes the source of truth, remove the V1 generator, cache, decoder, and fallback in the same change; do not leave V2 under a nested candidate directory.
+
 ## 2026-06-04
 
 - For OpenSkiMap GeoJSON, detect connection features with `properties.type = "connection"`. Reserve raw `piste:type = "connection"` for OSM/Overpass queries and preserve it only as source metadata after conversion.

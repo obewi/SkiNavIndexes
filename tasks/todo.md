@@ -77,9 +77,56 @@
   - `cargo test build_pipeline_writes_new_app_artifact_contract`
   - `cargo fmt -- --check`
   - `cargo test`
+- `git diff --check`
+- `cargo run --release -- all --dataset-version 2026-06-03 --skip-fetch`
+- `cargo run --release -- validate`
+
+## SQLite Index V2 — Canonical Release Cutover (2026-09-10)
+
+### Goal
+
+- Make the SQLite catalog and source packs the only generated and consumed resort-index contract.
+- Remove the obsolete JSON discovery index, render-package/release-pack generation, and compatibility fallbacks.
+- Publish the SQLite assets directly under `output/` so the release root is the client contract.
+
+### Plan
+
+- [x] Make canonical SQLite output write directly to `output/` and reject legacy output paths.
+- [x] Remove JSON/package/archive generation, validation, workflow publishing, and Rust modules/tests.
+- [x] Make SkiNav resolve the picker, repository regions, and processing scopes from `catalog.sqlite` only.
+- [x] Remove SkiNav’s resort cache, JSON decoder, render-bundle installer, and release-pack fallback.
+- [x] Run Rust formatting/tests/build/validation and SkiNav focused tests plus local simulator verification.
+
+## SQLite Index V2 — Phase 1: Hierarchy and Ownership Invariants (2026-09-10)
+
+### Goal
+
+- Preserve direct ownership of runs, lifts, spots, and connections on any resort node, including inferred domain/parent nodes.
+- Make normalized hierarchy and feature ownership fail-fast and cover the parent-only regression fixture from the V2 brief.
+- Superseded by the canonical SQLite release cutover above; V1 is not a supported release layout.
+
+### Plan
+
+- [x] Remove leaf-only filtering from normalized feature assignment.
+- [x] Validate resort IDs, parent references, tree cycles, and feature ownership after normalization.
+- [x] Emit direct parent-owned features without copying child features into domain packages.
+- [x] Add the Domain D / Child A / Child B / Run R parent-only regression.
+- [x] Add canonical SQLite catalog and compressed source-pack generation.
+- [x] Validate SQLite integrity, pack references, and the complete feature/ownership set.
+- [x] Run focused tests, the full Rust test suite, formatting, and diff checks.
+
+### Review
+
+- Normalized run/lift/spot/connection ownership now accepts domain/parent IDs and preserves every matched owner.
+- Resort hierarchy is stored only through `parent_id`; children are derived by the SkiNav catalog reader.
+- The canonical source packs use WKB geometry BLOBs, binary `elevationProfile` height arrays, normalized feature tables, and ownership join tables.
+- Validation runs SQLite quick/integrity/foreign-key checks, validates compressed asset hashes/metadata, checks catalog hierarchy and join completeness, and compares expected versus physical feature/ownership sets.
+- Verification passed:
+  - `cargo fmt -- --check`
+  - `cargo build --release`
+  - `cargo test`
+  - `cargo test parent_owned_features_survive_hierarchy_normalization`
   - `git diff --check`
-  - `cargo run --release -- all --dataset-version 2026-06-03 --skip-fetch`
-  - `cargo run --release -- validate`
 
 ## Pipeline Module Refactor (2026-06-07)
 

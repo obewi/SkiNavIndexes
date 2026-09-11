@@ -60,38 +60,20 @@ pub(super) struct NormalizedDataset {
     pub(super) lifts: Vec<FeatureRecord>,
     pub(super) spots: Vec<FeatureRecord>,
     pub(super) connections: Vec<FeatureRecord>,
-    pub(super) warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub(super) struct ResortRecord {
     pub(super) id: String,
     pub(super) name: String,
-    #[serde(rename = "type")]
-    pub(super) resort_type: String,
-    #[serde(rename = "parent_id")]
     pub(super) parent_id: Option<String>,
-    #[serde(rename = "parent_name")]
-    pub(super) parent_name: Option<String>,
     pub(super) bbox: [f64; 4],
-    #[serde(rename = "area_km2")]
     pub(super) area_km2: f64,
     pub(super) country: Option<String>,
-    #[serde(rename = "isoCodes")]
     pub(super) iso_codes: Vec<String>,
-    #[serde(rename = "countryCodes")]
-    pub(super) country_codes: Vec<String>,
-    #[serde(rename = "groupId")]
-    pub(super) group_id: String,
+    pub(super) pack_group_hint: String,
     pub(super) center: [f64; 2],
-    #[serde(rename = "childIds")]
-    pub(super) child_ids: Vec<String>,
-    #[serde(skip)]
     pub(super) run_convention: Option<String>,
-    #[serde(skip)]
-    pub(super) places: Value,
-    #[serde(skip)]
-    pub(super) statistics: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -100,34 +82,4 @@ pub(super) struct FeatureRecord {
     pub(super) resort_ids: Vec<String>,
     pub(super) geometry: Value,
     pub(super) properties: Map<String, Value>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ReleaseResortInput {
-    pub(super) id: String,
-    pub(super) estimated_size_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ReleaseGroupInput {
-    pub(super) group_id: String,
-    pub(super) resorts: Vec<ReleaseResortInput>,
-    pub(super) estimated_size_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ReleasePackGroup {
-    pub(super) group_id: String,
-    pub(super) part_index: Option<usize>,
-    pub(super) part_count: Option<usize>,
-    pub(super) resort_ids: Vec<String>,
-    pub(super) estimated_size_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ReleasePackPlan {
-    pub(super) asset_name: String,
-    pub(super) archive_type: &'static str,
-    pub(super) groups: Vec<ReleasePackGroup>,
-    pub(super) estimated_size_bytes: u64,
 }

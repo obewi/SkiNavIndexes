@@ -49,7 +49,7 @@ pub(super) fn build_from_cache(
         &dataset_version,
         generated_at,
     )?;
-    write_outputs(output_dir, &normalized)?;
+    write_source_outputs(output_dir, &normalized)?;
 
     Ok(BuildSummary {
         dataset_version,

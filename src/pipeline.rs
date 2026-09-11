@@ -4,8 +4,7 @@ mod geo;
 mod io;
 mod model;
 mod normalize;
-mod output;
-mod release;
+mod sqlite;
 mod validate;
 
 #[cfg(test)]
@@ -14,20 +13,16 @@ mod tests;
 use crate::cli::{Cli, Command};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use flate2::{Compression, write::GzEncoder};
 use reqwest::blocking::Client;
-use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     fs::{self, File},
     io::{BufReader, ErrorKind, Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
-use tar::Builder;
-use walkdir::WalkDir;
 
 use build::*;
 use fetch::*;
@@ -35,8 +30,7 @@ use geo::*;
 use io::*;
 use model::*;
 use normalize::*;
-use output::*;
-use release::*;
+use sqlite::*;
 use validate::*;
 
 const LAYER_FILES: [&str; 4] = [
@@ -46,11 +40,6 @@ const LAYER_FILES: [&str; 4] = [
     "spots.geojson",
 ];
 const CONNECTIONS_FILE: &str = "connections.geojson";
-const RENDER_SCHEMA_VERSION: i64 = 24;
-const PIPELINE_SCHEMA_VERSION: i64 = 1;
-const RELEASE_PACK_TARGET_BYTES: u64 = 24 * 1024 * 1024;
-const RELEASE_PACK_SMALL_GROUP_BYTES: u64 = 1 * 1024 * 1024;
-const RELEASE_PACK_LARGE_GROUP_BYTES: u64 = 24 * 1024 * 1024;
 const CONNECTION_ENDPOINT_MATCH_METERS: f64 = 60.0;
 const CONNECTION_SEGMENT_MATCH_METERS: f64 = 35.0;
 const CONNECTION_SEARCH_PADDING_METERS: f64 = 300.0;

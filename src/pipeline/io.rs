@@ -10,8 +10,6 @@ pub(super) fn reset_output_dir(output_dir: &Path) -> Result<()> {
         remove_generated_path(&entry.path())
             .with_context(|| format!("removing generated path {}", entry.path().display()))?;
     }
-    File::create(output_dir.join(".gitkeep"))
-        .with_context(|| format!("creating {}", output_dir.join(".gitkeep").display()))?;
     Ok(())
 }
 
@@ -116,68 +114,4 @@ pub(super) fn file_metadata(layer: &str, path: &Path, source_url: Option<String>
         "sizeBytes": metadata.len(),
         "sha256": sha256_file(path)?,
     }))
-}
-
-pub(super) fn file_manifest_for_dir(path: &Path) -> Result<Value> {
-    let mut files = Map::new();
-    for entry in WalkDir::new(path).min_depth(1).max_depth(1) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let file_path = entry.path();
-        let Some(name) = file_path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if name == "artifact_manifest.json" {
-            continue;
-        }
-        let size = fs::metadata(file_path)?.len();
-        files.insert(
-            name.to_string(),
-            json!({"sizeBytes": size, "sha256": sha256_file(file_path)?}),
-        );
-    }
-    Ok(Value::Object(files))
-}
-
-pub(super) fn directory_size(path: &Path) -> Result<u64> {
-    let mut total = 0;
-    for entry in WalkDir::new(path).min_depth(1) {
-        let entry = entry?;
-        if entry.file_type().is_file() {
-            total += entry.metadata()?.len();
-        }
-    }
-    Ok(total)
-}
-
-pub(super) fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    if target.exists() {
-        fs::remove_dir_all(target)?;
-    }
-    fs::create_dir_all(target)?;
-    for entry in WalkDir::new(source).min_depth(1) {
-        let entry = entry?;
-        let relative = entry.path().strip_prefix(source)?;
-        let destination = target.join(relative);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&destination)?;
-        } else {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(entry.path(), &destination)?;
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn create_tar_gz(source_dir: &Path, archive_path: &Path) -> Result<()> {
-    let file = File::create(archive_path)?;
-    let encoder = GzEncoder::new(file, Compression::default());
-    let mut archive = Builder::new(encoder);
-    archive.append_dir_all(".", source_dir)?;
-    archive.finish()?;
-    Ok(())
 }

@@ -21,8 +21,7 @@ fn pipeline_is_split_into_focused_modules() {
         "io.rs",
         "model.rs",
         "normalize.rs",
-        "output.rs",
-        "release.rs",
+        "sqlite.rs",
         "validate.rs",
     ] {
         assert!(

@@ -5,34 +5,34 @@
 - `https://tiles.openskimap.org/geojson/lifts.geojson`
 - `https://tiles.openskimap.org/geojson/ski_areas.geojson`
 - `https://tiles.openskimap.org/geojson/runs.geojson`
+- `https://tiles.openskimap.org/geojson/spots.geojson`
+- `connections.geojson` from OpenSkiMap or the fetch-time Overpass enrichment fallback.
 
 ## Current Implementation
 
 - [x] Rust CLI with `fetch`, `build`, `validate`, and `all` commands.
 - [x] One-download-per-dataset cache under `data/raw/openskimap/<dataset-version>/`.
-- [x] Discovery index generation for current SkiNav clients.
-- [x] Per-resort packages for leaf resorts.
-- [x] Reference-only domain packages so parent areas do not duplicate child artifacts.
-- [x] Group archive generation.
-- [x] Local app seed layout for simulator/device validation.
-- [x] Release workflow for manual GitHub Actions builds and optional GitHub Release publication.
+- [x] Canonical SQLite catalog generation for SkiNav resort discovery and statistics.
+- [x] SQLite source-pack generation with explicit feature ownership joins.
+- [x] Fail-fast hierarchy and ownership validation for catalog and source packs.
+- [x] Release workflow for root-level SQLite catalog and source-pack assets.
+- [x] SkiNav integration path for catalog-only resort discovery and processing.
 - [x] Generated output cleaned before rebuild to prevent stale deleted files from lingering.
 - [x] Generated `output/*` ignored by Git; root `latest.json` remains the tracked app entrypoint.
-- [x] Experimental balanced release packs split very large groups and combine very small groups.
+- [x] Remove obsolete V1 JSON/package/archive generation and nested candidate output.
 
 ## Validation Requirements
 
 - [x] `cargo test`
 - [x] `cargo run --release -- validate`
-- [x] Focused SkiNav integration tests for discovery decoding and local artifact loading.
+- [x] Focused SkiNav integration tests for SQLite catalog decoding and local artifact loading.
 - [ ] GitHub Actions release workflow dry run on pushed branch.
-- [ ] SkiNav integration check against pushed/released `latest.json` and `resorts.json`.
+- [ ] SkiNav integration check against pushed/released `latest.json` and `catalog.sqlite.gz`.
 
 ## Follow-Up Branches
 
 - Incremental source snapshot/change detection: compare current and previous OpenSkiMap source manifests, skip rebuild when unchanged, and report changed areas.
-- Archive packing strategy: test balanced `output/release-packs` artifacts against client download behavior before promoting to mainline release automation.
-- Client artifact lifecycle: version downloaded generated artifacts per resort, atomically promote verified versions, and prune older non-current versions through the downloaded-region lifecycle.
+- Client artifact lifecycle: version downloaded source packs per resort, atomically promote verified versions, and prune older non-current versions through the downloaded-region lifecycle.
 
 ---
 

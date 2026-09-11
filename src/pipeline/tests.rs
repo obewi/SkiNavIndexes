@@ -1,4 +1,7 @@
 use super::*;
+use flate2::read::GzDecoder;
+use rusqlite::{Connection, OptionalExtension};
+use std::{fs::File, io::copy};
 use tempfile::TempDir;
 
 #[test]
@@ -19,6 +22,38 @@ fn ski_area_ids_accept_strings_and_objects() {
 }
 
 #[test]
+fn stored_properties_prune_nested_assignment_properties() {
+    let props = Map::from_iter([
+        ("skiAreas".to_string(), json!(["area-a"])),
+        (
+            "stations".to_string(),
+            json!([{
+                "properties": {
+                    "id": "station-a",
+                    "skiAreas": [],
+                    "skiAreaIds": ["area-a"],
+                    "ski_area_ids": ["area-a"],
+                    "ski_area": "area-a"
+                }
+            }]),
+        ),
+    ]);
+
+    let stored = stored_properties(&props);
+    assert!(stored.get("skiAreas").is_none());
+    let station_properties = stored["stations"][0]["properties"]
+        .as_object()
+        .expect("station properties");
+    assert_eq!(station_properties.get("id"), Some(&json!("station-a")));
+    for key in ["skiAreas", "skiAreaIds", "ski_area_ids", "ski_area"] {
+        assert!(
+            station_properties.get(key).is_none(),
+            "nested assignment-only property was persisted: {key}"
+        );
+    }
+}
+
+#[test]
 fn bbox_scans_nested_geojson_coordinates() {
     let geometry = json!({
         "type": "MultiLineString",
@@ -31,6 +66,253 @@ fn bbox_scans_nested_geojson_coordinates() {
 }
 
 #[test]
+fn parent_owned_features_survive_hierarchy_normalization_and_sqlite_output() -> Result<()> {
+    let domain_id = "domain-d";
+    let child_a_id = "child-a";
+    let child_b_id = "child-b";
+    let ski_areas = vec![
+        source_feature(
+            json!({
+                "id": domain_id,
+                "name": "Domain D",
+                "status": "operating",
+                "activities": ["downhill"]
+            }),
+            json!({
+                "type": "Polygon",
+                "coordinates": [[[10.0, 46.0], [10.2, 46.0], [10.2, 46.2], [10.0, 46.2], [10.0, 46.0]]]
+            }),
+        ),
+        source_feature(
+            json!({
+                "id": child_a_id,
+                "name": "Child A",
+                "status": "operating",
+                "activities": ["downhill"]
+            }),
+            json!({
+                "type": "Polygon",
+                "coordinates": [[[10.02, 46.02], [10.08, 46.02], [10.08, 46.08], [10.02, 46.08], [10.02, 46.02]]]
+            }),
+        ),
+        source_feature(
+            json!({
+                "id": child_b_id,
+                "name": "Child B",
+                "status": "operating",
+                "activities": ["downhill"]
+            }),
+            json!({
+                "type": "Polygon",
+                "coordinates": [[[10.12, 46.12], [10.18, 46.12], [10.18, 46.18], [10.12, 46.18], [10.12, 46.12]]]
+            }),
+        ),
+    ];
+    let runs = vec![
+        source_feature(
+            json!({
+                "id": "parent-run",
+                "uses": ["downhill"],
+                "status": "operating",
+                "skiAreas": [domain_id],
+                "elevationProfile": {
+                    "heights": [100.0, 90.0],
+                    "resolution": 10.0,
+                    "targetResolution": 5.0
+                }
+            }),
+            json!({"type": "LineString", "coordinates": [[10.04, 46.04], [10.05, 46.05]]}),
+        ),
+        source_feature(
+            json!({
+                "id": "child-a-run",
+                "uses": ["downhill"],
+                "status": "operating",
+                "skiAreas": [domain_id, child_a_id]
+            }),
+            json!({"type": "LineString", "coordinates": [[10.06, 46.06], [10.07, 46.07]]}),
+        ),
+        source_feature(
+            json!({
+                "id": "child-b-run",
+                "uses": ["downhill"],
+                "status": "operating",
+                "skiAreas": [domain_id, child_b_id]
+            }),
+            json!({"type": "LineString", "coordinates": [[10.14, 46.14], [10.15, 46.15]]}),
+        ),
+    ];
+    let spots = vec![source_feature(
+        json!({"id": "parent-spot", "skiAreas": [domain_id]}),
+        json!({"type": "Point", "coordinates": [10.05, 46.05]}),
+    )];
+    let connections = vec![source_feature(
+        json!({
+            "id": "parent-connection",
+            "type": "connection",
+            "piste:type": "connection",
+            "skiAreas": [domain_id]
+        }),
+        json!({"type": "LineString", "coordinates": [[10.05, 46.05], [10.06, 46.06]]}),
+    )];
+
+    let dataset = normalize_sources(
+        ski_areas,
+        runs,
+        Vec::new(),
+        spots,
+        connections,
+        "2026-09-10",
+        Utc::now(),
+    )?;
+    assert_eq!(
+        dataset
+            .resorts
+            .iter()
+            .filter(|resort| resort.parent_id.as_deref() == Some(domain_id))
+            .map(|resort| resort.id.clone())
+            .collect::<Vec<_>>(),
+        vec![child_a_id.to_string(), child_b_id.to_string()]
+    );
+    assert_eq!(
+        dataset
+            .runs
+            .iter()
+            .find(|run| run.id == "parent-run")
+            .expect("parent-owned run")
+            .resort_ids,
+        vec![domain_id.to_string()]
+    );
+    assert_eq!(
+        dataset
+            .spots
+            .iter()
+            .find(|spot| spot.id == "parent-spot")
+            .expect("parent-owned spot")
+            .resort_ids,
+        vec![domain_id.to_string()]
+    );
+    assert_eq!(
+        dataset
+            .connections
+            .iter()
+            .find(|connection| connection.id == "parent-connection")
+            .expect("parent-owned connection")
+            .resort_ids,
+        vec![domain_id.to_string()]
+    );
+
+    let output = TempDir::new()?;
+    write_source_outputs(output.path(), &dataset)?;
+    validate_output(output.path())?;
+    assert_canonical_output(output.path())?;
+
+    let catalog_dir = unpack_gzip_asset(output.path(), "catalog.sqlite.gz")?;
+    let catalog = Connection::open(catalog_dir.path().join("catalog.sqlite"))?;
+    assert_eq!(
+        catalog.query_row(
+            "SELECT parent_id FROM resorts WHERE id = ?1",
+            [child_a_id],
+            |row| row.get::<_, Option<String>>(0)
+        )?,
+        Some(domain_id.to_string())
+    );
+    assert_eq!(
+        catalog.query_row(
+            "SELECT run_count FROM resort_source_stats WHERE resort_id = ?1",
+            [domain_id],
+            |row| row.get::<_, i64>(0)
+        )?,
+        3
+    );
+
+    let pack_name = fs::read_dir(output.path())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("pack-") && name.ends_with(".sqlite.gz"))
+        .expect("source pack");
+    let pack_dir = unpack_gzip_asset(output.path(), &pack_name)?;
+    let pack = Connection::open(pack_dir.path().join(pack_name.trim_end_matches(".gz")))?;
+    let parent_properties: String = pack.query_row(
+        "SELECT properties_json FROM runs WHERE id = ?1",
+        ["parent-run"],
+        |row| row.get(0),
+    )?;
+    let parent_properties: Value = serde_json::from_str(&parent_properties)?;
+    for key in ["skiAreas", "skiAreaIds", "ski_area_ids", "ski_area"] {
+        assert!(
+            parent_properties.get(key).is_none(),
+            "assignment-only property was persisted: {key}"
+        );
+    }
+    assert_eq!(parent_properties.get("uses"), Some(&json!(["downhill"])));
+    let parent_run = pack
+        .query_row(
+            "SELECT typeof(geometry_wkb), length(geometry_wkb), typeof(elevation_profile), length(elevation_profile), elevation_resolution, elevation_target_resolution FROM runs WHERE id = ?1",
+            ["parent-run"],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, f64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    assert_eq!(
+        parent_run,
+        Some(("blob".to_string(), 41, "blob".to_string(), 16, 10.0, 5.0))
+    );
+    Ok(())
+}
+
+#[test]
+fn normalized_validation_rejects_orphan_feature_ownership() {
+    let dataset = NormalizedDataset {
+        dataset_version: "2026-09-10".to_string(),
+        generated_at: Utc::now(),
+        resorts: vec![test_resort("known", "Known", "resort", None)],
+        runs: vec![feature_record(
+            "orphan-run",
+            vec!["missing".to_string()],
+            json!({"uses": ["downhill"]}),
+            json!({"type": "LineString", "coordinates": [[10.0, 46.0], [10.01, 46.01]]}),
+        )],
+        lifts: Vec::new(),
+        spots: Vec::new(),
+        connections: Vec::new(),
+    };
+
+    let error = validate_normalized_dataset(&dataset).expect_err("orphan ownership must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("references missing resort missing")
+    );
+}
+
+#[test]
+fn normalized_validation_rejects_hierarchy_cycles() {
+    let left = test_resort("left", "Left", "resort", Some("right"));
+    let right = test_resort("right", "Right", "resort", Some("left"));
+    let dataset = NormalizedDataset {
+        dataset_version: "2026-09-10".to_string(),
+        generated_at: Utc::now(),
+        resorts: vec![left, right],
+        runs: Vec::new(),
+        lifts: Vec::new(),
+        spots: Vec::new(),
+        connections: Vec::new(),
+    };
+
+    let error = validate_normalized_dataset(&dataset).expect_err("cycle must fail");
+    assert!(error.to_string().contains("hierarchy contains a cycle"));
+}
+
+#[test]
 fn openskimap_connection_detection_uses_geojson_type_property() -> Result<()> {
     let cache = TempDir::new()?;
     let dataset_dir = cache.path().join("2026-06-04");
@@ -39,13 +321,11 @@ fn openskimap_connection_detection_uses_geojson_type_property() -> Result<()> {
         &dataset_dir.join("runs.geojson"),
         &json!({
             "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "properties": {"id": "run-1", "type": "run", "piste:type": "connection"},
-                    "geometry": {"type": "LineString", "coordinates": [[10.0, 46.0], [10.1, 46.1]]}
-                }
-            ]
+            "features": [{
+                "type": "Feature",
+                "properties": {"id": "run-1", "type": "run", "piste:type": "connection"},
+                "geometry": {"type": "LineString", "coordinates": [[10.0, 46.0], [10.1, 46.1]]}
+            }]
         }),
     )?;
     write_json_pretty(
@@ -79,10 +359,7 @@ fn overpass_way_conversion_preserves_raw_piste_type_and_adds_openskimap_type() -
                     {"lat": 46.5593027, "lon": 11.9532744},
                     {"lat": 46.5594386, "lon": 11.9534193}
                 ],
-                "tags": {
-                    "name": "Armentarola",
-                    "piste:type": "connection"
-                }
+                "tags": {"name": "Armentarola", "piste:type": "connection"}
             },
             {"type": "way", "id": 1, "tags": {"piste:type": "connection"}}
         ]
@@ -119,126 +396,8 @@ fn overpass_way_conversion_preserves_raw_piste_type_and_adds_openskimap_type() -
 }
 
 #[test]
-fn real_dolomiti_connection_is_packaged_with_leaf_resort_not_domain() -> Result<()> {
-    let cache = TempDir::new()?;
-    let dataset_dir = cache.path().join("2026-06-04");
-    fs::create_dir_all(&dataset_dir)?;
-    let dolomiti_id = "480f0abbee27a7e26a20a29d9bf947db63bef9a9";
-    let alta_badia_id = "41ca531357e0d2a532b8ab94e3e9fe74ddbe88c4";
-
-    write_json_pretty(
-        &dataset_dir.join("ski_areas.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "id": dolomiti_id,
-                        "name": "Dolomiti Superski",
-                        "status": "operating",
-                        "activities": ["downhill"],
-                        "places": [{"iso3166_2": "IT-BL", "iso3166_1Alpha2": "IT"}]
-                    },
-                    "geometry": {"type": "Polygon", "coordinates": [[[11.8, 46.4], [12.1, 46.4], [12.1, 46.7], [11.8, 46.7], [11.8, 46.4]]]}
-                },
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "id": alta_badia_id,
-                        "name": "Alta Badia",
-                        "status": "operating",
-                        "activities": ["downhill"],
-                        "places": [{"iso3166_2": "IT-BZ", "iso3166_1Alpha2": "IT"}]
-                    },
-                    "geometry": {"type": "Polygon", "coordinates": [[[11.9, 46.5], [12.0, 46.5], [12.0, 46.6], [11.9, 46.6], [11.9, 46.5]]]}
-                }
-            ]
-        }),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("runs.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [{
-                "type": "Feature",
-                "properties": {
-                    "id": "armentarola-run",
-                    "name": "Armentarola",
-                    "uses": ["downhill"],
-                    "status": "operating",
-                    "sources": [{"id": "way/49436042", "type": "openstreetmap"}],
-                    "skiAreas": [dolomiti_id, alta_badia_id]
-                },
-                "geometry": {"type": "LineString", "coordinates": [[11.9532744, 46.5593027], [11.9534193, 46.5594386]]}
-            }]
-        }),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("lifts.geojson"),
-        &json!({"type": "FeatureCollection", "features": []}),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("connections.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [{
-                "type": "Feature",
-                "id": "way/49436042",
-                "properties": {
-                    "id": "way/49436042",
-                    "name": "Armentarola",
-                    "type": "connection",
-                    "piste:type": "connection",
-                    "osm_type": "way",
-                    "osm_id": "49436042",
-                    "sources": [{"id": "way/49436042", "type": "openstreetmap"}]
-                },
-                "geometry": {"type": "LineString", "coordinates": [[11.9532744, 46.5593027], [11.9534193, 46.5594386]]}
-            }]
-        }),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("spots.geojson"),
-        &json!({"type": "FeatureCollection", "features": []}),
-    )?;
-
-    let output = TempDir::new()?;
-    build_from_cache(cache.path(), output.path(), Some("2026-06-04".to_string()))?;
-
-    let leaf_connections = read_json(
-        &output
-            .path()
-            .join("packages/resorts")
-            .join(alta_badia_id)
-            .join("connections.geojson"),
-    )?;
-    assert_eq!(feature_count(&leaf_connections), 1);
-    let parent_connections = output
-        .path()
-        .join("packages/resorts")
-        .join(dolomiti_id)
-        .join("connections.geojson");
-    assert!(!parent_connections.exists());
-    let resorts = read_json(&output.path().join("resorts.json"))?;
-    let alta_badia = resorts
-        .get("resorts")
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .find(|resort| resort.get("id").and_then(Value::as_str) == Some(alta_badia_id))
-        .expect("Alta Badia resort");
-    assert_eq!(
-        alta_badia.get("parent_id").and_then(Value::as_str),
-        Some(dolomiti_id)
-    );
-    validate_output(output.path())?;
-    Ok(())
-}
-
-#[test]
-fn connection_assignment_uses_explicit_leaf_ski_area() {
-    let mut warnings = Vec::new();
+fn connection_assignment_preserves_explicit_parent_and_child_ownership() {
+    let domain_id = "domain-a".to_string();
     let leaf_id = "leaf-a".to_string();
     let connections = vec![connection_record(
         "explicit-connection",
@@ -249,7 +408,8 @@ fn connection_assignment_uses_explicit_leaf_ski_area() {
         }),
         json!({"type": "LineString", "coordinates": [[10.0, 46.0], [10.01, 46.01]]}),
     )];
-    let assigned = assign_connections_to_leaf_resorts(
+    let mut warnings = Vec::new();
+    let assigned = assign_connections_to_resorts(
         connections,
         &domain_and_leaf_resorts("domain-a", &leaf_id),
         &[],
@@ -258,7 +418,7 @@ fn connection_assignment_uses_explicit_leaf_ski_area() {
     );
 
     assert_eq!(assigned.len(), 1);
-    assert_eq!(assigned[0].resort_ids, vec![leaf_id]);
+    assert_eq!(assigned[0].resort_ids, vec![domain_id, leaf_id]);
     assert!(warnings.is_empty());
 }
 
@@ -274,7 +434,7 @@ fn connection_assignment_uses_network_proximity_and_rejects_bbox_only_matches() 
     );
 
     let mut warnings = Vec::new();
-    let assigned = assign_connections_to_leaf_resorts(
+    let assigned = assign_connections_to_resorts(
         vec![connection_record(
             "network-connection",
             json!({"id": "network-connection", "type": "connection"}),
@@ -291,7 +451,7 @@ fn connection_assignment_uses_network_proximity_and_rejects_bbox_only_matches() 
     assert!(warnings.is_empty());
 
     let mut warnings = Vec::new();
-    let rejected = assign_connections_to_leaf_resorts(
+    let rejected = assign_connections_to_resorts(
         vec![connection_record(
             "bbox-only-connection",
             json!({"id": "bbox-only-connection", "type": "connection"}),
@@ -343,7 +503,7 @@ fn connection_assignment_duplicates_real_bridge_between_leaf_resorts() {
     );
 
     let mut warnings = Vec::new();
-    let assigned = assign_connections_to_leaf_resorts(
+    let assigned = assign_connections_to_resorts(
         vec![connection],
         &resorts,
         &[left_run, right_run],
@@ -357,9 +517,9 @@ fn connection_assignment_duplicates_real_bridge_between_leaf_resorts() {
 }
 
 #[test]
-fn build_pipeline_writes_export_layout_without_local_app() -> Result<()> {
+fn build_pipeline_writes_only_canonical_sqlite_output() -> Result<()> {
     let cache = TempDir::new()?;
-    let dataset_dir = cache.path().join("2026-06-03");
+    let dataset_dir = cache.path().join("2026-09-10");
     fs::create_dir_all(&dataset_dir)?;
     write_json_pretty(
         &dataset_dir.join("ski_areas.geojson"),
@@ -393,427 +553,49 @@ fn build_pipeline_writes_export_layout_without_local_app() -> Result<()> {
                     "status": "operating",
                     "skiAreas": ["area-1"]
                 },
-                "geometry": {"type": "LineString", "coordinates": [[10.0, 46.1], [10.1, 46.0]]}
+                "geometry": {"type": "LineString", "coordinates": [[10.0, 46.0], [10.1, 46.0]]}
             }]
         }),
     )?;
-    write_json_pretty(
-        &dataset_dir.join("lifts.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [{
-                "type": "Feature",
-                "properties": {
-                    "id": "lift-1",
-                    "name": "Lift",
-                    "liftType": "chair_lift",
-                    "status": "operating",
-                    "skiAreas": ["area-1"]
-                },
-                "geometry": {"type": "LineString", "coordinates": [[10.1, 46.0], [10.0, 46.1]]}
-            }]
-        }),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("connections.geojson"),
-        &json!({"type": "FeatureCollection", "features": []}),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("spots.geojson"),
-        &json!({"type": "FeatureCollection", "features": []}),
-    )?;
-
-    let output = TempDir::new()?;
-    let summary = build_from_cache(cache.path(), output.path(), Some("2026-06-03".to_string()))?;
-    assert_eq!(summary.resort_count, 1);
-    assert!(output.path().join("resorts.json").exists());
-    assert!(
-        output
-            .path()
-            .join("packages/resorts/area-1/manifest.json")
-            .exists()
-    );
-    assert!(!output.path().join("local-app").exists());
-    validate_output(output.path())?;
-    assert!(output.path().join("release-packs/manifest.json").exists());
-    Ok(())
-}
-
-#[test]
-fn release_pack_planner_splits_large_groups_and_combines_small_groups() {
-    let groups = vec![
-        ReleaseGroupInput {
-            group_id: "AT-7".to_string(),
-            resorts: vec![
-                ReleaseResortInput {
-                    id: "large-a".to_string(),
-                    estimated_size_bytes: 18 * 1024 * 1024,
-                },
-                ReleaseResortInput {
-                    id: "large-b".to_string(),
-                    estimated_size_bytes: 18 * 1024 * 1024,
-                },
-            ],
-            estimated_size_bytes: 36 * 1024 * 1024,
-        },
-        ReleaseGroupInput {
-            group_id: "BE-A".to_string(),
-            resorts: vec![ReleaseResortInput {
-                id: "small-a".to_string(),
-                estimated_size_bytes: 128 * 1024,
-            }],
-            estimated_size_bytes: 128 * 1024,
-        },
-        ReleaseGroupInput {
-            group_id: "BE-B".to_string(),
-            resorts: vec![ReleaseResortInput {
-                id: "small-b".to_string(),
-                estimated_size_bytes: 128 * 1024,
-            }],
-            estimated_size_bytes: 128 * 1024,
-        },
-        ReleaseGroupInput {
-            group_id: "FR-73".to_string(),
-            resorts: vec![ReleaseResortInput {
-                id: "medium-a".to_string(),
-                estimated_size_bytes: 2 * 1024 * 1024,
-            }],
-            estimated_size_bytes: 2 * 1024 * 1024,
-        },
-    ];
-
-    let packs = plan_release_packs(groups);
-    let asset_names = packs
-        .iter()
-        .map(|pack| pack.asset_name.as_str())
-        .collect::<Vec<_>>();
-
-    assert!(asset_names.contains(&"AT-7.part-001-of-002.tar.gz"));
-    assert!(asset_names.contains(&"AT-7.part-002-of-002.tar.gz"));
-    assert!(asset_names.contains(&"FR-73.tar.gz"));
-    assert!(asset_names.contains(&"small-groups-001.tar.gz"));
-
-    let small_pack = packs
-        .iter()
-        .find(|pack| pack.asset_name == "small-groups-001.tar.gz")
-        .expect("small groups pack");
-    assert_eq!(small_pack.archive_type, "small-groups");
-    assert_eq!(small_pack.groups.len(), 2);
-}
-
-#[test]
-fn build_pipeline_writes_new_app_artifact_contract() -> Result<()> {
-    let cache = TempDir::new()?;
-    let dataset_dir = cache.path().join("2026-06-06");
-    fs::create_dir_all(&dataset_dir)?;
-    write_json_pretty(
-        &dataset_dir.join("ski_areas.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [{
-                "type": "Feature",
-                "properties": {
-                    "id": "area-1",
-                    "name": "Demo",
-                    "status": "operating",
-                    "activities": ["downhill"],
-                    "runConvention": "europe",
-                    "places": [{"iso3166_2": "AT-7", "iso3166_1Alpha2": "AT"}]
-                },
-                "geometry": {"type": "Polygon", "coordinates": [[[10.0, 46.0], [10.2, 46.0], [10.2, 46.2], [10.0, 46.2], [10.0, 46.0]]]}
-            }]
-        }),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("runs.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "id": "downhill-line",
-                        "name": "Blue One",
-                        "difficulty": "easy",
-                        "uses": ["downhill"],
-                        "status": "operating",
-                        "skiAreas": ["area-1"],
-                        "skiAreaIds": ["area-1"],
-                        "elevationProfile": {
-                            "heights": [2100.0, 2080.0],
-                            "resolution": 25.0,
-                            "targetResolution": 25.0
-                        }
-                    },
-                    "geometry": {"type": "LineString", "coordinates": [[10.0, 46.1, 2100.0], [10.1, 46.0, 2080.0]]}
-                },
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "id": "park-line",
-                        "name": "Jump Line",
-                        "uses": ["snow_park"],
-                        "status": "operating",
-                        "skiAreas": ["area-1"],
-                        "elevationProfile": {
-                            "heights": [2050.0, 2040.0],
-                            "resolution": 10.0,
-                            "targetResolution": 10.0
-                        }
-                    },
-                    "geometry": {"type": "LineString", "coordinates": [[10.02, 46.1, 2050.0], [10.03, 46.09, 2040.0]]}
-                },
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "id": "park-polygon",
-                        "uses": ["snow_park"],
-                        "status": "operating",
-                        "skiAreas": ["area-1"]
-                    },
-                    "geometry": {"type": "Polygon", "coordinates": [[[10.03, 46.11], [10.04, 46.11], [10.04, 46.12], [10.03, 46.12], [10.03, 46.11]]]}
-                },
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "id": "playground-polygon",
-                        "uses": ["playground"],
-                        "status": "operating",
-                        "skiAreas": ["area-1"]
-                    },
-                    "geometry": {"type": "Polygon", "coordinates": [[[10.05, 46.11], [10.06, 46.11], [10.06, 46.12], [10.05, 46.12], [10.05, 46.11]]]}
-                },
-                {
-                    "type": "Feature",
-                    "properties": {"id": "sled-line", "uses": ["sled"], "status": "operating", "skiAreas": ["area-1"]},
-                    "geometry": {"type": "LineString", "coordinates": [[10.0, 46.08], [10.01, 46.08]]}
-                },
-                {
-                    "type": "Feature",
-                    "properties": {"id": "skitour-line", "uses": ["skitour"], "status": "operating", "skiAreas": ["area-1"]},
-                    "geometry": {"type": "LineString", "coordinates": [[10.0, 46.07], [10.01, 46.07]]}
-                }
-            ]
-        }),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("lifts.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [{
-                "type": "Feature",
-                "properties": {
-                    "id": "lift-1",
-                    "name": "Lift",
-                    "liftType": "chair_lift",
-                    "status": "operating",
-                    "skiAreas": ["area-1"],
-                    "stations": [
-                        {
-                            "type": "Feature",
-                            "properties": {"id": "station-bottom", "skiAreas": ["area-1"], "position": "bottom"},
-                            "geometry": {"type": "Point", "coordinates": [10.1, 46.0, 2080.0]}
-                        }
-                    ]
-                },
-                "geometry": {"type": "LineString", "coordinates": [[10.1, 46.0, 2080.0], [10.0, 46.1, 2100.0]]}
-            }]
-        }),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("connections.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [{
-                "type": "Feature",
-                "id": "connection-1",
-                "properties": {
-                    "id": "connection-1",
-                    "type": "connection",
-                    "piste:type": "connection",
-                    "skiAreas": ["area-1"]
-                },
-                "geometry": {"type": "LineString", "coordinates": [[10.1, 46.0], [10.11, 46.0]]}
-            }]
-        }),
-    )?;
-    write_json_pretty(
-        &dataset_dir.join("spots.geojson"),
-        &json!({
-            "type": "FeatureCollection",
-            "features": [
-                {"type": "Feature", "properties": {"id": "crossing-yes", "spotType": "crossing", "dismount": "yes", "skiAreas": ["area-1"]}, "geometry": {"type": "Point", "coordinates": [10.01, 46.01]}},
-                {"type": "Feature", "properties": {"id": "crossing-sometimes", "spotType": "crossing", "dismount": "sometimes", "skiAreas": ["area-1"]}, "geometry": {"type": "Point", "coordinates": [10.02, 46.01]}},
-                {"type": "Feature", "properties": {"id": "crossing-no", "spotType": "crossing", "dismount": "no", "skiAreas": ["area-1"]}, "geometry": {"type": "Point", "coordinates": [10.03, 46.01]}}
-            ]
-        }),
-    )?;
-
-    let output = TempDir::new()?;
-    let summary = build_from_cache(cache.path(), output.path(), Some("2026-06-06".to_string()))?;
-    assert_eq!(summary.resort_count, 1);
-    assert_eq!(summary.run_count, 4);
-
-    let package = output.path().join("packages/resorts/area-1");
-    assert!(package.join("downhill_lines.geojson").exists());
-    assert!(package.join("downhill_polygons.geojson").exists());
-    assert!(package.join("downhill_centerlines.geojson").exists());
-    assert!(package.join("connection_sections.geojson").exists());
-    assert!(package.join("spots.geojson").exists());
-    assert!(!package.join("runs.geojson").exists());
-    assert!(!package.join("run_sections.geojson").exists());
-    assert!(!package.join("lift_stations.geojson").exists());
-    assert!(!package.join("run_matching_hints.json").exists());
-    assert!(!package.join("explore_detail.json").exists());
-    assert!(!package.join("checksums.json").exists());
-
-    let downhill_lines = read_json(&package.join("downhill_lines.geojson"))?;
-    let line_ids = feature_ids(&downhill_lines);
-    assert!(line_ids.contains("downhill-line"));
-    assert!(line_ids.contains("park-line"));
-    assert!(!line_ids.contains("park-polygon"));
-    assert!(!line_ids.contains("playground-polygon"));
-    assert!(!line_ids.contains("sled-line"));
-    assert!(!line_ids.contains("skitour-line"));
-
-    let downhill_polygons = read_json(&package.join("downhill_polygons.geojson"))?;
-    let polygon_ids = feature_ids(&downhill_polygons);
-    assert!(!polygon_ids.contains("downhill-line"));
-    assert!(!polygon_ids.contains("park-line"));
-    assert!(polygon_ids.contains("park-polygon"));
-    assert!(polygon_ids.contains("playground-polygon"));
-    assert!(
-        feature_by_id(&downhill_lines, "downhill-line")
-            .and_then(|feature| feature.get("geometry"))
-            .and_then(|geometry| geometry.get("coordinates"))
-            .and_then(Value::as_array)
-            .and_then(|coords| coords.first())
-            .and_then(Value::as_array)
-            .is_some_and(|coord| coord.len() == 3)
-    );
-    assert_eq!(
-        feature_by_id(&downhill_lines, "downhill-line")
-            .and_then(|feature| feature.get("properties"))
-            .and_then(|props| props.get("elevationProfile"))
-            .and_then(|profile| profile.get("targetResolution"))
-            .and_then(Value::as_f64),
-        Some(25.0)
-    );
-
-    let downhill_centerlines = read_json(&package.join("downhill_centerlines.geojson"))?;
-    assert_eq!(
-        feature_by_id(&downhill_centerlines, "downhill-line-0")
-            .and_then(|feature| feature.get("properties"))
-            .and_then(|props| props.get("elevationProfile"))
-            .and_then(|profile| profile.get("heights"))
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(2)
-    );
-
-    let lifts = read_json(&package.join("lifts.geojson"))?;
-    assert_eq!(
-        lifts
-            .get("features")
-            .and_then(Value::as_array)
-            .and_then(|features| features.first())
-            .and_then(|feature| feature.get("properties"))
-            .and_then(|props| props.get("stations"))
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(1)
-    );
-
-    let spots = read_json(&package.join("spots.geojson"))?;
-    assert_eq!(feature_count(&spots), 3);
-    let dismount_values = spots
-        .get("features")
-        .and_then(Value::as_array)
-        .unwrap()
-        .iter()
-        .filter_map(|feature| {
-            feature
-                .get("properties")
-                .and_then(|props| props.get("dismount"))
-                .and_then(Value::as_str)
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(dismount_values, BTreeSet::from(["no", "sometimes", "yes"]));
-
-    for file in [
-        "downhill_lines.geojson",
-        "downhill_polygons.geojson",
-        "downhill_centerlines.geojson",
-        "lifts.geojson",
-        "connections.geojson",
-        "connection_sections.geojson",
-        "spots.geojson",
-    ] {
-        assert_no_assignment_keys(&read_json(&package.join(file))?);
+    for filename in ["lifts.geojson", "connections.geojson", "spots.geojson"] {
+        write_json_pretty(
+            &dataset_dir.join(filename),
+            &json!({"type": "FeatureCollection", "features": []}),
+        )?;
     }
 
-    let manifest = read_json(&package.join("manifest.json"))?;
-    assert_eq!(
-        manifest
-            .get("files")
-            .and_then(|files| files.get("downhillLines"))
-            .and_then(Value::as_str),
-        Some("downhill_lines.geojson")
-    );
-    assert_eq!(
-        manifest
-            .get("files")
-            .and_then(|files| files.get("downhillPolygons"))
-            .and_then(Value::as_str),
-        Some("downhill_polygons.geojson")
-    );
-    assert_eq!(
-        manifest
-            .get("files")
-            .and_then(|files| files.get("downhillCenterlines"))
-            .and_then(Value::as_str),
-        Some("downhill_centerlines.geojson")
-    );
-    assert_eq!(
-        manifest
-            .get("files")
-            .and_then(|files| files.get("spots"))
-            .and_then(Value::as_str),
-        Some("spots.geojson")
-    );
-    assert!(
-        !manifest
-            .get("files")
-            .and_then(Value::as_object)
-            .is_some_and(|files| {
-                files.contains_key("runMatchingHints") || files.contains_key("exploreDetail")
-            })
-    );
-    assert_eq!(
-        manifest
-            .get("stats")
-            .and_then(|stats| stats.get("spotFeatureCount"))
-            .and_then(Value::as_u64),
-        Some(3)
-    );
-    assert_eq!(
-        manifest
-            .get("stats")
-            .and_then(|stats| stats.get("downhillPolygonFeatureCount"))
-            .and_then(Value::as_u64),
-        Some(2)
-    );
-    let latest = read_json(&output.path().join("latest.json"))?;
-    assert!(
-        !latest
-            .as_object()
-            .unwrap()
-            .contains_key("localArtifactRoot")
-    );
-    assert!(!output.path().join("local-app").exists());
-    assert!(output.path().join("release-packs/manifest.json").exists());
+    let output = TempDir::new()?;
+    let summary = build_from_cache(cache.path(), output.path(), Some("2026-09-10".to_string()))?;
+    assert_eq!(summary.resort_count, 1);
+    assert_canonical_output(output.path())?;
     validate_output(output.path())?;
     Ok(())
+}
+
+fn assert_canonical_output(output: &Path) -> Result<()> {
+    assert!(output.join("latest.json").exists());
+    assert!(output.join("catalog.sqlite.gz").exists());
+    assert!(fs::read_dir(output)?.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        name.starts_with("pack-") && name.ends_with(".sqlite.gz")
+    }));
+    for legacy in ["resorts.json", "packages", "groups", "release-packs", "v2"] {
+        assert!(
+            !output.join(legacy).exists(),
+            "legacy output exists: {legacy}"
+        );
+    }
+    Ok(())
+}
+
+fn unpack_gzip_asset(output: &Path, asset: &str) -> Result<TempDir> {
+    let unpacked = TempDir::new()?;
+    let input = File::open(output.join(asset))?;
+    let mut decoder = GzDecoder::new(input);
+    let destination = unpacked.path().join(asset.trim_end_matches(".gz"));
+    let mut file = File::create(&destination)?;
+    copy(&mut decoder, &mut file)?;
+    Ok(unpacked)
 }
 
 fn domain_and_leaf_resorts(domain_id: &str, leaf_id: &str) -> Vec<ResortRecord> {
@@ -823,24 +605,26 @@ fn domain_and_leaf_resorts(domain_id: &str, leaf_id: &str) -> Vec<ResortRecord> 
     ]
 }
 
-fn test_resort(id: &str, name: &str, resort_type: &str, parent_id: Option<&str>) -> ResortRecord {
+fn test_resort(id: &str, name: &str, _resort_type: &str, parent_id: Option<&str>) -> ResortRecord {
     ResortRecord {
         id: id.to_string(),
         name: name.to_string(),
-        resort_type: resort_type.to_string(),
+        pack_group_hint: "IT-BZ".to_string(),
         parent_id: parent_id.map(str::to_string),
-        parent_name: parent_id.map(|_| "Domain".to_string()),
         bbox: [10.0, 46.0, 10.02, 46.02],
         area_km2: 1.0,
         country: Some("IT".to_string()),
         iso_codes: vec!["IT-BZ".to_string()],
-        country_codes: vec!["IT".to_string()],
-        group_id: "IT-BZ".to_string(),
         center: [10.01, 46.01],
-        child_ids: Vec::new(),
         run_convention: Some("europe".to_string()),
-        places: Value::Null,
-        statistics: Value::Null,
+    }
+}
+
+fn source_feature(properties: Value, geometry: Value) -> SourceFeature {
+    SourceFeature {
+        id: None,
+        properties: properties.as_object().cloned().unwrap_or_default(),
+        geometry,
     }
 }
 
@@ -859,45 +643,5 @@ fn feature_record(
         resort_ids,
         properties: properties.as_object().cloned().unwrap_or_default(),
         geometry,
-    }
-}
-
-fn feature_ids(collection: &Value) -> BTreeSet<&str> {
-    collection
-        .get("features")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|feature| feature.get("id").and_then(Value::as_str))
-        .collect()
-}
-
-fn feature_by_id<'a>(collection: &'a Value, id: &str) -> Option<&'a Value> {
-    collection
-        .get("features")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|feature| feature.get("id").and_then(Value::as_str) == Some(id))
-}
-
-fn assert_no_assignment_keys(value: &Value) {
-    match value {
-        Value::Object(object) => {
-            for key in ["skiAreas", "skiAreaIds", "ski_area_ids", "ski_area"] {
-                assert!(
-                    !object.contains_key(key),
-                    "found assignment key {key} in {value:#}"
-                );
-            }
-            for child in object.values() {
-                assert_no_assignment_keys(child);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                assert_no_assignment_keys(item);
-            }
-        }
-        _ => {}
     }
 }
