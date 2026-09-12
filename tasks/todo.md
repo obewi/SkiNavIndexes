@@ -22,6 +22,36 @@
 
 # Worker A SkiNavIndexes Todo
 
+## Source Pack Locality and Release Contract (2026-09-12)
+
+### Goal
+
+- Keep canonical parent coverage local, cap normal compressed source packs, pin catalog/pack acquisition to one immutable release, and remove the obsolete JSON discovery schema.
+
+### Plan
+
+- [x] Add canonical-root-aware, geographically local pack planning with deterministic size budgets.
+- [x] Validate actual compressed pack sizes and complete canonical processing-scope download totals.
+- [x] Add immutable release identity to `latest.json` and pin SkiNav asset downloads to it.
+- [x] Remove the obsolete JSON discovery schema and update active V1/V2 contract references.
+- [x] Restore and preserve the existing lift-station topology changes.
+- [x] Run producer tests/build/validation and the app Debug build where the environment permits; the app test target remains blocked by pre-existing Swift 6 actor-isolation fixture errors.
+
+### Acceptance
+
+- [x] Compare the old and candidate layouts on the same cached source snapshot for Ischgl/Sölden, a small standalone resort, and multi-pack parent domains.
+- [ ] Verify graph/Explore coverage and ownership parity on a device, plus zero same-release warm asset downloads in the released app.
+- [x] Verify immutable-release URL construction with app tests and the producer release contract.
+
+### Local evidence (2026-09-12)
+
+- The old layout produced 10 packs totaling 101.3 MB; its Ischgl/Sölden pack was 11.3 MB.
+- The candidate produced 721 geographically bounded packs totaling 94.9 MB; the largest normal pack was 6.45 MB. Ischgl/Sölden share a 5.82 MB pack.
+- Les Trois Vallées, Les Portes du Soleil, and Dolomiti Superski each resolve to one local pack in the candidate snapshot.
+- `cargo fmt -- --check`, `cargo test --locked`, `cargo run --release -- all --skip-fetch`, and standalone `validate` passed. The cached snapshot lacked the optional station-topology file, so that build intentionally contained no station memberships.
+- The SkiNav Debug simulator build passed. The full SkiNav test target still cannot compile because of unrelated pre-existing Swift 6 actor-isolation errors in matcher/routing fixtures.
+
+
 ## Plan
 
 - [x] Map current `src/main.rs` pipeline and preserve existing behavior boundaries.
@@ -162,3 +192,58 @@
   - `git diff --check`
   - `cargo run --release -- all --dataset-version 2026-06-03 --skip-fetch`
   - `cargo run --release -- validate`
+## Lift Station Topology Enrichment (2026-09-11)
+
+### Goal
+
+- Enrich OSM-backed lift stations with bounded station-to-lift topology, normalize it as a many-to-many relationship, and publish it in source schema v3 for SkiNav's routing and rendering paths.
+
+### Plan
+
+- [x] Add targeted Overpass station topology fetch/cache output and CLI control.
+- [x] Normalize station/lift memberships and transfer-station annotations.
+- [x] Publish and validate `lift_station_memberships` in SQLite source schema v3.
+- [x] Update SkiNav's SQLite loader, station hub links, and transfer-station icon expression.
+- [x] Add focused Rust/Swift coverage and update contract documentation.
+
+### Verification
+
+- [x] Run focused Rust tests and formatting.
+- [x] Run the smallest available XcodeBuildMCP build/test check.
+- [x] Record exact pass/skip/blocker results before closing this task.
+
+Verification: Rust formatting and tests pass. The SkiNav simulator build passes through XcodeBuildMCP; the focused test target remains blocked by pre-existing Swift 6 global-actor errors in unrelated test fixtures before tests execute. The tracked release pointer remains the existing v2 release until a v3 dataset is generated and published with matching SQLite asset hashes.
+
+## Pre-publication V3 Review (2026-09-14)
+
+Mode: review. Scope: origin/main (3dd2ee6) through fe5854e; no production edits or publication.
+
+- [x] Verify remote base and inspect release/catalog compatibility with SkiNav V3.
+- [x] Run Rust tests, formatting, and diff checks.
+- [x] Review station topology and pack ownership together.
+- [x] Build and validate the cached real snapshot in an isolated temporary output directory.
+- [x] Record actionable findings and publication readiness.
+
+Initial verification: 19 unit tests plus 1 structure test passed; formatting and diff checks passed. The available 2026-09-10 cache lacks station topology, so cached-release validation cannot establish live enrichment acceptance.
+
+Review result: not ready to publish V3. Two findings:
+
+- P1: `src/pipeline/sqlite.rs:419` writes station memberships only when station and lift are already present in the same pack. In the exact cached snapshot, Winteregg lift `way/150270143` is in pack-0034 while its actual bottom station `node/1631925115` is in pack-0211. A rebuild using symlinked original cached inputs plus that one real membership fails with `SQLite lift station membership set mismatch: expected 1, actual 0`. Reproduction log: `/tmp/skinavindexes-topology-review.log`; fixture cache: `/tmp/skinavindexes-topology-review-cache`. Preserve station/lift membership availability across pack boundaries and add this real-data regression.
+- P2: `src/pipeline/fetch.rs:135` ignores Overpass runtime-error remarks in successful HTTP JSON responses. A local HTTP 200 fixture containing a timeout remark and `elements: []` makes `fetch` exit 0 and persist an empty station membership cache. Reject runtime-error/partial responses before cache promotion. Probe cache: `/tmp/skinavindexes-overpass-review-20260914/cache/review`. The reference OverPy implementation separately rejects JSON remarks after accepting HTTP 200: https://python-overpy.readthedocs.io/en/latest/_modules/overpy.html#Overpass.parse_json
+
+Passed: 19 Rust unit tests + 1 structure test, cargo formatting, diff whitespace checks, and current-HEAD release-mode `all --skip-fetch` against the 2026-09-10 real cache. Generated 4,523 resorts and 721 packs; largest compressed pack 6,446,918 bytes, total compressed packs 94,867,108 bytes. Output: `/tmp/skinavindexes-review-20260914`. Its metadata has schemaVersion 3 and releaseTag indexes-2026-09-10, matching the app metadata shape.
+
+Limits: ordinary cached build had no station enrichment; the targeted enriched build fails as described. No complete live Overpass fetch, iOS runtime verification, source fixes, commits, pushes, or release publication. Pushing main does not trigger publication; after fixes, manually dispatch the release workflow with publishing enabled and an unused dataset version.
+
+## V3 Review Fixes (2026-09-14)
+
+Mode: implement. Scope: the two actionable findings from the pre-publication V3 review above.
+
+- [x] Preserve lift-station memberships when topology endpoints have different source-pack owners.
+- [x] Reject Overpass runtime-error remarks before enrichment cache promotion.
+- [x] Add exact Winteregg cross-pack and simulated timeout regressions.
+- [x] Re-run the cached real-data release build and output validation.
+
+Review result: topology normalization now propagates the complete resort-owner set across each connected station/lift component. The existing SQLite pack writer consequently stores both endpoint rows and the membership in every relevant pack while retaining foreign-key and ownership-set validation. Overpass JSON with any `remark` is rejected before either topology or connection enrichment is cached.
+
+Verification: 21 Rust unit tests plus 1 structure test passed; `cargo fmt -- --check` and `git diff --check` passed; the exact cached 2026-09-10 enriched Winteregg reproduction built successfully in release mode and standalone output validation passed. The membership and both endpoint rows were confirmed in `pack-0034.sqlite.gz` and `pack-0211.sqlite.gz`. No commits, pushes, or release publication were performed.

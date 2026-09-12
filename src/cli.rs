@@ -27,6 +27,8 @@ pub(crate) enum Command {
         overpass_base_url: String,
         #[arg(long)]
         skip_connection_enrichment: bool,
+        #[arg(long)]
+        skip_station_topology_enrichment: bool,
     },
     /// Build the canonical SQLite catalog and source packs from cached source files.
     Build {
@@ -56,6 +58,8 @@ pub(crate) enum Command {
         overpass_base_url: String,
         #[arg(long)]
         skip_connection_enrichment: bool,
+        #[arg(long)]
+        skip_station_topology_enrichment: bool,
         #[arg(long)]
         skip_fetch: bool,
     },

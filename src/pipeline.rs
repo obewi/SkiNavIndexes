@@ -14,10 +14,11 @@ use crate::cli::{Cli, Command};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
     io::{BufReader, ErrorKind, Read, Write},
     path::{Path, PathBuf},
@@ -40,6 +41,8 @@ const LAYER_FILES: [&str; 4] = [
     "spots.geojson",
 ];
 const CONNECTIONS_FILE: &str = "connections.geojson";
+const LIFT_STATION_TOPOLOGY_FILE: &str = "lift_station_topology.json";
+const LIFT_STATION_TOPOLOGY_BATCH_SIZE: usize = 200;
 const CONNECTION_ENDPOINT_MATCH_METERS: f64 = 60.0;
 const CONNECTION_SEGMENT_MATCH_METERS: f64 = 35.0;
 const CONNECTION_SEARCH_PADDING_METERS: f64 = 300.0;
@@ -54,12 +57,14 @@ pub fn run() -> Result<()> {
             source_base_url,
             overpass_base_url,
             skip_connection_enrichment,
+            skip_station_topology_enrichment,
         } => fetch_sources(
             &cache_dir,
             dataset_version,
             &source_base_url,
             &overpass_base_url,
             skip_connection_enrichment,
+            skip_station_topology_enrichment,
         ),
         Command::Build {
             cache_dir,
@@ -84,6 +89,7 @@ pub fn run() -> Result<()> {
             source_base_url,
             overpass_base_url,
             skip_connection_enrichment,
+            skip_station_topology_enrichment,
             skip_fetch,
         } => {
             if !skip_fetch {
@@ -93,6 +99,7 @@ pub fn run() -> Result<()> {
                     &source_base_url,
                     &overpass_base_url,
                     skip_connection_enrichment,
+                    skip_station_topology_enrichment,
                 )?;
             }
             let summary = build_from_cache(&cache_dir, &output_dir, dataset_version)?;

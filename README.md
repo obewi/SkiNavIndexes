@@ -18,8 +18,11 @@ The CLI caches these files under `data/raw/openskimap/<dataset-version>/` by def
 Connection features are cached as an enrichment layer at:
 
 - `data/raw/openskimap/<dataset-version>/connections.geojson`
+- `data/raw/openskimap/<dataset-version>/lift_station_topology.json`
 
 OpenSkiMap GeoJSON is checked first. When OpenSkiMap contains connection features, they are identified by `properties.type = "connection"` and copied into `connections.geojson`. When OpenSkiMap does not yet contain those features, `fetch` uses a narrow Overpass fallback for raw OSM `piste:type=connection` ways and relations. The default Overpass base URL is `https://overpass-api.de/api/`, and requests use the SkiNavIndexes user agent configured in the CLI. Overpass is only used by `fetch`; `build` and `all --skip-fetch` never query the network.
+
+Lift-station topology is fetched as a second bounded Overpass enrichment. The query is built only from `node/<id>` and `way/<id>` OSM sources found in `spots.geojson` where `spotType = "lift_station"`; it does not scan the world for stations. The cached `lift_station_topology.json` records station-to-lift memberships and contact coordinates, which are normalized into the source schema v3 `lift_station_memberships` table. Use `--skip-station-topology-enrichment` for an intentional build without this enrichment.
 
 ## Commands
 
@@ -58,6 +61,9 @@ cargo run --release -- all
 
 # Rebuild and validate from the local cache without any network fetch.
 cargo run --release -- all --skip-fetch
+
+# Fetch the base layers and connections without station topology enrichment.
+cargo run --release -- fetch --skip-station-topology-enrichment
 ```
 
 Useful options:
@@ -82,7 +88,7 @@ cargo run --release -- fetch --overpass-base-url https://overpass-api.de/api/
 
 The intended workflow is:
 
-1. Run `cargo run --release -- fetch --dataset-version <version>` once for the dataset version. This downloads missing OpenSkiMap layers, including `spots.geojson`, and creates `connections.geojson` from OpenSkiMap `type=connection` features or the Overpass fallback.
+1. Run `cargo run --release -- fetch --dataset-version <version>` once for the dataset version. This downloads missing OpenSkiMap layers, including `spots.geojson`, creates `connections.geojson` from OpenSkiMap `type=connection` features or the Overpass fallback, and fetches bounded station topology for the OSM station sources present in that snapshot.
 2. Re-run `cargo run --release -- build --dataset-version <version>` as often as needed.
 3. Re-run `cargo run --release -- validate` after builds.
 4. Use `cargo run --release -- all --dataset-version <version> --skip-fetch` when you want the full local build and validation path without touching the network.
@@ -102,13 +108,20 @@ output/
 
 Key files:
 
-- `latest.json` is the stable app entrypoint. It identifies the schema, dataset, and verified `catalog.sqlite.gz` metadata.
+- `latest.json` is the stable app entrypoint. It identifies the schema, dataset, immutable GitHub release tag, pack policy, and verified `catalog.sqlite.gz` metadata.
 - `catalog.sqlite.gz` contains resort hierarchy, names, ISO metadata, source-pack references, and per-resort source statistics.
 - `pack-*.sqlite.gz` contains normalized source feature tables and explicit ownership join tables. A resort can reference more than one pack, and a feature can be owned by more than one resort.
 
-There is no generated discovery JSON, per-resort package tree, group archive, release-pack tarball, or nested `output/v2/` candidate. `latest.json` is metadata only; resort search and future catalog statistics come from SQLite.
+Pack planning is hierarchy-aware and deterministic. A canonical root and all of its
+descendants stay together when they fit the estimated 16 MiB budget. Larger roots are
+split into root-local packs and are never mixed with another root. Small standalone
+roots may share a pack only with geographically nearby standalone roots in the same
+2° grid cell. Generated output is checked against an 8 MiB compressed ceiling for
+normal packs; an intrinsically oversized single-resort pack is the only exception.
 
-The catalog tables are `metadata`, `resorts`, `resort_iso_codes`, `packs`, `resort_packs`, and `resort_source_stats`. Source packs contain `runs`, `lifts`, `spots`, and `connections` plus explicit ownership join tables. Geometry is stored as little-endian WKB, elevation profiles as little-endian `f64` sequences, and normalized feature properties remain available as row-level JSON for future app features. Redundant resort-assignment properties are omitted because ownership is stored in the join tables.
+There is no generated discovery JSON, JSON schema, per-resort package tree, group archive, release-pack tarball, or nested `output/v2/` candidate. `latest.json` is metadata only; resort search and future catalog statistics come from SQLite.
+
+The catalog tables are `metadata`, `resorts`, `resort_iso_codes`, `packs`, `resort_packs`, and `resort_source_stats`. Source schema v3 packs contain `runs`, `lifts`, `spots`, and `connections` plus explicit ownership join tables and `lift_station_memberships`. Geometry is stored as little-endian WKB, elevation profiles as little-endian `f64` sequences, and normalized feature properties remain available as row-level JSON for future app features. Redundant resort-assignment properties are omitted because ownership is stored in the join tables.
 
 The pipeline intentionally does not generate app-owned render bundles or local simulator artifacts. SkiNav installs source packs from this release and creates its own render/graph artifacts locally.
 
@@ -126,7 +139,7 @@ Pull requests run Rust smoke checks only: build, tests, and CLI help. Manual dis
 
 The workflow does not use `actions/cache` or `actions/upload-artifact`; generated data is deleted in the final cleanup step. GitHub still retains workflow logs and run metadata according to the repository's Actions retention settings, and the published release assets are intentionally stored as GitHub Release assets for SkiNav to download.
 
-The public release contract is the root-level `latest.json`, `catalog.sqlite.gz`, and `pack-*.sqlite.gz` assets.
+The public release contract is the root-level `latest.json`, `catalog.sqlite.gz`, and `pack-*.sqlite.gz` assets. The release tag in `latest.json` is the immutable tag used for the catalog and pack asset URLs; clients do not resolve individual assets through a moving `releases/latest` URL. The publishing workflow refuses to mutate an existing release tag.
 
 The build writes that release contract directly under `output/`:
 
@@ -137,7 +150,7 @@ output/
 └── pack-<number>.sqlite.gz
 ```
 
-The catalog contains hierarchy, ISO metadata, pack references, and per-resort source statistics. Each compressed source pack contains normalized feature tables and ownership join tables. There is no V1 discovery index or archive-generation step.
+The catalog contains hierarchy, ISO metadata, pack references, and per-resort source statistics. Each compressed source pack contains normalized feature tables and ownership join tables. There is no legacy discovery index or archive-generation step.
 
 For a dry run from a pushed branch:
 

@@ -80,6 +80,13 @@
 - Peak Rust build RSS is still high because the first implementation keeps normalized run/lift geometry in memory while writing packages.
 - The client now consumes remote `latest.json` and `catalog.sqlite.gz`; source-pack download and app-owned render/graph artifact lifecycle remain separate concerns.
 
+## 2026-09-14 - V3 pre-publication fixes
+
+- Propagated shared resort ownership across every connected lift-station topology component so cross-pack station memberships retain both foreign-key endpoints and remain queryable from either endpoint's resort scope.
+- Rejected Overpass JSON responses carrying a `remark` before caching topology or connection enrichment, including HTTP 200 runtime-error responses.
+- Added exact Winteregg source-ID coverage and a local HTTP timeout-response cache-promotion regression.
+- Verification passed: `cargo test` (21 unit tests plus 1 structure test), `cargo fmt -- --check`, `git diff --check`, release-mode cached real-data build, standalone output validation, and direct inspection of the Winteregg membership in both relevant source packs.
+
 ## 2026-06-07
 
 - Restored split run export artifacts: `downhill_lines.geojson`, `downhill_polygons.geojson`, and `downhill_centerlines.geojson`.

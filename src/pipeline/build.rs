@@ -38,14 +38,31 @@ pub(super) fn build_from_cache(
     let lifts = read_feature_collection(&dataset_dir.join("lifts.geojson"))?;
     let spots = read_feature_collection(&dataset_dir.join("spots.geojson"))?;
     let connections = read_feature_collection(&connections_path)?;
+    let station_topology_path = dataset_dir.join(LIFT_STATION_TOPOLOGY_FILE);
+    let station_topology = if station_topology_path.exists() {
+        let value = read_json(&station_topology_path)?;
+        serde_json::from_value(value).with_context(|| {
+            format!(
+                "parsing cached lift station topology {}",
+                station_topology_path.display()
+            )
+        })?
+    } else {
+        eprintln!(
+            "cached lift station topology is absent; building without station memberships: {}",
+            station_topology_path.display()
+        );
+        Vec::new()
+    };
 
     let generated_at = Utc::now();
-    let normalized = normalize_sources(
+    let normalized = normalize_sources_with_topology(
         ski_areas,
         runs,
         lifts,
         spots,
         connections,
+        station_topology,
         &dataset_version,
         generated_at,
     )?;

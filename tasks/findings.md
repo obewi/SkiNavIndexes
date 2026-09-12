@@ -20,13 +20,18 @@
 - Release builds publish only the root-level `latest.json`, `catalog.sqlite.gz`, and `pack-*.sqlite.gz` assets.
 - The pipeline does not generate local app artifacts; SkiNav downloads source packs and creates its app-owned artifacts locally.
 
-## SQLite V2 Migration
+## SQLite V3 source contract
 
 - Parent/domain resort IDs are valid direct owners for every normalized feature kind; leaf-only assignment is no longer a storage invariant.
 - The root-level SQLite catalog owns hierarchy, metadata, pack references, and source statistics; source packs own normalized feature rows and explicit ownership join rows.
 - Resort-assignment properties are not part of the source-pack payload contract: `skiAreas`-style nested features duplicate the catalog/join ownership data and are omitted from `properties_json`.
-- V2 pack validation compares feature/ownership sets rather than aggregate counts because a feature may be duplicated physically across packs.
+- V3 pack validation compares feature/ownership sets rather than aggregate counts because a feature may be duplicated physically across packs.
 - Cross-pack feature duplication remains an intentional download-efficiency tradeoff for shared ownership; after assignment-property compaction it is a small minority of the payload.
+- `latest.json` carries `releaseTag` and the deterministic pack policy. SkiNav pins catalog and source-pack downloads to that release tag after reading the moving metadata entrypoint.
+- Release publication refuses to overwrite an existing release tag, so a pinned asset path cannot silently change after publication.
+- Pack planning keeps canonical parent coverage local, splits oversized roots without mixing them with unrelated roots, and combines only geographically nearby standalone roots.
+- Lift-station topology endpoints are shared owners across each connected station/lift component, allowing the SQLite writer to materialize valid memberships in every relevant source pack even when the original source associations use different resort roots.
+- Overpass enrichment rejects any JSON response containing a `remark` before promoting the derived cache, because HTTP 200 can still carry a runtime error or partial result.
 
 ## SkiNav Client
 

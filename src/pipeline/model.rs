@@ -60,6 +60,32 @@ pub(super) struct NormalizedDataset {
     pub(super) lifts: Vec<FeatureRecord>,
     pub(super) spots: Vec<FeatureRecord>,
     pub(super) connections: Vec<FeatureRecord>,
+    pub(super) lift_station_memberships: Vec<LiftStationMembership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LiftStationTopology {
+    pub(super) station_source: String,
+    pub(super) members: Vec<LiftStationTopologyMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LiftStationTopologyMember {
+    pub(super) lift_source: String,
+    pub(super) contact_node: String,
+    pub(super) coordinate: [f64; 2],
+    pub(super) contact_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct LiftStationMembership {
+    pub(super) station_id: String,
+    pub(super) lift_id: String,
+    pub(super) source_node_id: Option<String>,
+    pub(super) contact: [f64; 2],
+    pub(super) contact_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +97,6 @@ pub(super) struct ResortRecord {
     pub(super) area_km2: f64,
     pub(super) country: Option<String>,
     pub(super) iso_codes: Vec<String>,
-    pub(super) pack_group_hint: String,
     pub(super) center: [f64; 2],
     pub(super) run_convention: Option<String>,
 }

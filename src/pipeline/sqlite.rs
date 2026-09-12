@@ -7,15 +7,29 @@ use std::{
     io::{self, BufReader},
 };
 
-const SOURCE_SCHEMA_VERSION: i64 = 2;
-// The planner estimates compact row payloads; SQLite pages and indexes add roughly
-// 25% on disk, so this target keeps packs useful without leaving a tiny tail pack.
-const SOURCE_PACK_TARGET_BYTES: u64 = 28 * 1024 * 1024;
+const SOURCE_SCHEMA_VERSION: i64 = 3;
+// The planner estimates compact row payloads. Keeping the estimate at 16 MiB
+// leaves room for SQLite pages, indexes, and gzip variance while keeping normal
+// downloads below the 8 MiB compressed ceiling on the published snapshot.
+const SOURCE_PACK_TARGET_BYTES: u64 = 16 * 1024 * 1024;
+const SOURCE_PACK_MAX_COMPRESSED_BYTES: u64 = 8 * 1024 * 1024;
+const SOURCE_PACK_COMBINE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const SOURCE_PACK_GRID_DEGREES: f64 = 2.0;
 
 #[derive(Clone, Debug)]
-struct SourcePackPlan {
-    pack_id: String,
+pub(super) struct SourcePackPlan {
+    pub(super) pack_id: String,
+    pub(super) resort_ids: Vec<String>,
+    pub(super) allows_oversized: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PackUnit {
     resort_ids: Vec<String>,
+    estimated_bytes: u64,
+    sort_key: String,
+    location: [f64; 2],
+    allows_oversized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +46,16 @@ struct OwnershipKey {
     feature_kind: &'static str,
     feature_id: String,
     resort_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LiftStationMembershipKey {
+    station_id: String,
+    lift_id: String,
+    source_node_id: Option<String>,
+    contact_kind: Option<String>,
+    contact_lon_bits: u64,
+    contact_lat_bits: u64,
 }
 
 #[derive(Debug)]
@@ -105,6 +129,13 @@ pub(super) fn write_source_outputs(output_dir: &Path, dataset: &NormalizedDatase
     let latest = json!({
         "schemaVersion": SOURCE_SCHEMA_VERSION,
         "datasetVersion": dataset.dataset_version,
+        "releaseTag": release_tag_for_dataset(&dataset.dataset_version),
+        "packPolicy": {
+            "estimatedTargetBytes": SOURCE_PACK_TARGET_BYTES,
+            "maxCompressedBytes": SOURCE_PACK_MAX_COMPRESSED_BYTES,
+            "combinedStandaloneMaxEstimatedBytes": SOURCE_PACK_COMBINE_MAX_BYTES,
+            "gridDegrees": SOURCE_PACK_GRID_DEGREES
+        },
         "catalog": {
             "asset": catalog_artifact.asset,
             "compressedBytes": catalog_artifact.compressed_bytes,
@@ -117,44 +148,175 @@ pub(super) fn write_source_outputs(output_dir: &Path, dataset: &NormalizedDatase
     Ok(())
 }
 
-fn plan_source_packs(dataset: &NormalizedDataset) -> Result<Vec<SourcePackPlan>> {
-    let mut by_group: BTreeMap<&str, Vec<&ResortRecord>> = BTreeMap::new();
+pub(super) fn plan_source_packs(dataset: &NormalizedDataset) -> Result<Vec<SourcePackPlan>> {
+    let resort_by_id = dataset
+        .resorts
+        .iter()
+        .map(|resort| (resort.id.as_str(), resort))
+        .collect::<BTreeMap<_, _>>();
+    let mut members_by_root: BTreeMap<String, Vec<&ResortRecord>> = BTreeMap::new();
     for resort in &dataset.resorts {
-        by_group
-            .entry(resort.pack_group_hint.as_str())
-            .or_default()
-            .push(resort);
+        let root_id = canonical_root_resort_id(resort.id.as_str(), &resort_by_id)?;
+        members_by_root.entry(root_id).or_default().push(resort);
     }
 
-    let mut plans = Vec::new();
-    let mut current_resort_ids = Vec::new();
-    let mut current_size = 0_u64;
-    for resorts in by_group.values() {
-        for resort in resorts {
-            let estimate = estimate_resort_source_bytes(dataset, resort)?;
-            if !current_resort_ids.is_empty()
-                && current_size.saturating_add(estimate) > SOURCE_PACK_TARGET_BYTES
-            {
-                plans.push(SourcePackPlan {
-                    pack_id: format!("pack-{:04}", plans.len() + 1),
-                    resort_ids: std::mem::take(&mut current_resort_ids),
-                });
-                current_size = 0;
+    let mut fixed_units = Vec::new();
+    let mut combinable_units: BTreeMap<(i32, i32), Vec<PackUnit>> = BTreeMap::new();
+    for (root_id, mut members) in members_by_root {
+        members.sort_by(|lhs, rhs| lhs.id.cmp(&rhs.id));
+        let root_location = members
+            .first()
+            .map(|resort| resort.center)
+            .unwrap_or([0.0, 0.0]);
+        let estimates = members
+            .iter()
+            .map(|resort| estimate_resort_source_bytes(dataset, resort))
+            .collect::<Result<Vec<_>>>()?;
+        let total_estimate = estimates.iter().copied().fold(0_u64, u64::saturating_add);
+
+        if total_estimate <= SOURCE_PACK_TARGET_BYTES {
+            let can_combine = members.len() == 1 && total_estimate <= SOURCE_PACK_COMBINE_MAX_BYTES;
+            let unit = PackUnit {
+                resort_ids: members.iter().map(|resort| resort.id.clone()).collect(),
+                estimated_bytes: total_estimate,
+                sort_key: root_id.clone(),
+                location: root_location,
+                allows_oversized: false,
+            };
+            if can_combine {
+                combinable_units
+                    .entry(spatial_cell(unit.location))
+                    .or_default()
+                    .push(unit);
+            } else {
+                fixed_units.push(unit);
             }
-            current_resort_ids.push(resort.id.clone());
-            current_size = current_size.saturating_add(estimate);
+            continue;
+        }
+
+        let mut current_ids = Vec::new();
+        let mut current_estimate = 0_u64;
+        let mut part_index = 0_usize;
+        for (member, estimate) in members.into_iter().zip(estimates) {
+            if !current_ids.is_empty()
+                && current_estimate.saturating_add(estimate) > SOURCE_PACK_TARGET_BYTES
+            {
+                fixed_units.push(PackUnit {
+                    resort_ids: std::mem::take(&mut current_ids),
+                    estimated_bytes: current_estimate,
+                    sort_key: format!("{root_id}#part-{part_index:04}"),
+                    location: root_location,
+                    allows_oversized: current_estimate > SOURCE_PACK_TARGET_BYTES,
+                });
+                current_estimate = 0;
+                part_index += 1;
+            }
+            current_ids.push(member.id.clone());
+            current_estimate = current_estimate.saturating_add(estimate);
+        }
+        if !current_ids.is_empty() {
+            fixed_units.push(PackUnit {
+                resort_ids: current_ids,
+                estimated_bytes: current_estimate,
+                sort_key: format!("{root_id}#part-{part_index:04}"),
+                location: root_location,
+                allows_oversized: current_estimate > SOURCE_PACK_TARGET_BYTES,
+            });
         }
     }
-    if !current_resort_ids.is_empty() {
-        plans.push(SourcePackPlan {
-            pack_id: format!("pack-{:04}", plans.len() + 1),
-            resort_ids: current_resort_ids,
-        });
+
+    for (_cell, mut units) in combinable_units {
+        units.sort_by(|lhs, rhs| lhs.sort_key.cmp(&rhs.sort_key));
+        let mut current = None;
+        for unit in units {
+            let should_flush = current.as_ref().is_some_and(|current: &PackUnit| {
+                current.estimated_bytes.saturating_add(unit.estimated_bytes)
+                    > SOURCE_PACK_TARGET_BYTES
+            });
+            if should_flush {
+                fixed_units.push(current.take().expect("current standalone pack unit"));
+            }
+            if let Some(current) = current.as_mut() {
+                current.resort_ids.extend(unit.resort_ids);
+                current.estimated_bytes =
+                    current.estimated_bytes.saturating_add(unit.estimated_bytes);
+                if unit.sort_key.as_str() < current.sort_key.as_str() {
+                    current.sort_key = unit.sort_key;
+                }
+            } else {
+                current = Some(unit);
+            }
+        }
+        if let Some(unit) = current {
+            fixed_units.push(unit);
+        }
     }
+
+    fixed_units.sort_by(|lhs, rhs| {
+        lhs.sort_key
+            .cmp(&rhs.sort_key)
+            .then_with(|| lhs.resort_ids.cmp(&rhs.resort_ids))
+    });
+
+    let plans = fixed_units
+        .into_iter()
+        .enumerate()
+        .map(|(index, unit)| SourcePackPlan {
+            pack_id: format!("pack-{:04}", index + 1),
+            resort_ids: unit.resort_ids,
+            allows_oversized: unit.allows_oversized,
+        })
+        .collect::<Vec<_>>();
     if plans.is_empty() {
         bail!("cannot generate SQLite source packs without resorts");
     }
+
+    let expected_resort_ids = dataset
+        .resorts
+        .iter()
+        .map(|resort| resort.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let actual_resort_ids = plans
+        .iter()
+        .flat_map(|plan| plan.resort_ids.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let actual_resort_count = plans
+        .iter()
+        .map(|plan| plan.resort_ids.len())
+        .sum::<usize>();
+    if actual_resort_count != expected_resort_ids.len() || actual_resort_ids != expected_resort_ids
+    {
+        bail!("source pack planner does not cover every resort exactly once");
+    }
     Ok(plans)
+}
+
+fn canonical_root_resort_id(
+    resort_id: &str,
+    resorts_by_id: &BTreeMap<&str, &ResortRecord>,
+) -> Result<String> {
+    let mut current_id = resort_id;
+    let mut visited = BTreeSet::new();
+    while let Some(resort) = resorts_by_id.get(current_id) {
+        if !visited.insert(current_id) {
+            bail!("resort hierarchy contains a cycle at {current_id}");
+        }
+        let Some(parent_id) = resort.parent_id.as_deref() else {
+            return Ok(current_id.to_string());
+        };
+        if !resorts_by_id.contains_key(parent_id) {
+            bail!("resort {current_id} references missing parent {parent_id}");
+        }
+        current_id = parent_id;
+    }
+    bail!("resort hierarchy is missing resort {resort_id}")
+}
+
+fn spatial_cell(center: [f64; 2]) -> (i32, i32) {
+    (
+        ((center[0] + 180.0) / SOURCE_PACK_GRID_DEGREES).floor() as i32,
+        ((center[1] + 90.0) / SOURCE_PACK_GRID_DEGREES).floor() as i32,
+    )
 }
 
 fn estimate_resort_source_bytes(dataset: &NormalizedDataset, resort: &ResortRecord) -> Result<u64> {
@@ -174,6 +336,29 @@ fn estimate_resort_source_bytes(dataset: &NormalizedDataset, resort: &ResortReco
             )
             .saturating_add(256);
     }
+    let owned_station_ids = dataset
+        .spots
+        .iter()
+        .filter(|record| record.resort_ids.iter().any(|id| id == &resort.id))
+        .map(|record| record.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let owned_lift_ids = dataset
+        .lifts
+        .iter()
+        .filter(|record| record.resort_ids.iter().any(|id| id == &resort.id))
+        .map(|record| record.id.as_str())
+        .collect::<BTreeSet<_>>();
+    size = size.saturating_add(
+        dataset
+            .lift_station_memberships
+            .iter()
+            .filter(|membership| {
+                owned_station_ids.contains(membership.station_id.as_str())
+                    && owned_lift_ids.contains(membership.lift_id.as_str())
+            })
+            .count() as u64
+            * 96,
+    );
     Ok(size)
 }
 
@@ -216,6 +401,27 @@ fn write_source_pack(
     for record in &dataset.connections {
         if record.resort_ids.iter().any(|id| resort_ids.contains(id)) {
             insert_connection(&transaction, record)?;
+        }
+    }
+    let station_ids = dataset
+        .spots
+        .iter()
+        .filter(|record| record.resort_ids.iter().any(|id| resort_ids.contains(id)))
+        .map(|record| record.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let lift_ids = dataset
+        .lifts
+        .iter()
+        .filter(|record| record.resort_ids.iter().any(|id| resort_ids.contains(id)))
+        .map(|record| record.id.as_str())
+        .collect::<BTreeSet<_>>();
+    // Topology normalization shares endpoint ownership across connected resort
+    // scopes, so both foreign-key targets are intentionally present here.
+    for membership in &dataset.lift_station_memberships {
+        if station_ids.contains(membership.station_id.as_str())
+            && lift_ids.contains(membership.lift_id.as_str())
+        {
+            insert_lift_station_membership(&transaction, membership)?;
         }
     }
     transaction.commit()?;
@@ -319,11 +525,21 @@ fn create_source_schema(connection: &Connection) -> Result<()> {
             resort_id TEXT NOT NULL,
             PRIMARY KEY (connection_id, resort_id)
         );
+        CREATE TABLE lift_station_memberships (
+            station_id TEXT NOT NULL REFERENCES spots(id) ON DELETE CASCADE,
+            lift_id TEXT NOT NULL REFERENCES lifts(id) ON DELETE CASCADE,
+            source_node_id TEXT,
+            contact_lon REAL NOT NULL,
+            contact_lat REAL NOT NULL,
+            contact_kind TEXT,
+            PRIMARY KEY (station_id, lift_id)
+        );
 
         CREATE INDEX run_resorts_resort_idx ON run_resorts(resort_id);
         CREATE INDEX lift_resorts_resort_idx ON lift_resorts(resort_id);
         CREATE INDEX spot_resorts_resort_idx ON spot_resorts(resort_id);
         CREATE INDEX connection_resorts_resort_idx ON connection_resorts(resort_id);
+        CREATE INDEX lift_station_memberships_lift_idx ON lift_station_memberships(lift_id);
         "#,
     )?;
     Ok(())
@@ -446,6 +662,24 @@ fn insert_connection(transaction: &Transaction<'_>, record: &FeatureRecord) -> R
         &record.id,
         &record.resort_ids,
     )
+}
+
+fn insert_lift_station_membership(
+    transaction: &Transaction<'_>,
+    membership: &LiftStationMembership,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO lift_station_memberships (station_id, lift_id, source_node_id, contact_lon, contact_lat, contact_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            membership.station_id,
+            membership.lift_id,
+            membership.source_node_id,
+            membership.contact[0],
+            membership.contact[1],
+            membership.contact_kind,
+        ],
+    )?;
+    Ok(())
 }
 
 fn verify_feature_payload(
@@ -804,6 +1038,14 @@ fn validate_source_release(
         {
             bail!("{} compressed asset metadata mismatch", artifact.asset);
         }
+        if artifact.compressed_bytes > SOURCE_PACK_MAX_COMPRESSED_BYTES && !plan.allows_oversized {
+            bail!(
+                "{} compressed size {} exceeds the {} MiB source-pack ceiling",
+                plan.pack_id,
+                artifact.compressed_bytes,
+                SOURCE_PACK_MAX_COMPRESSED_BYTES / (1024 * 1024)
+            );
+        }
     }
     let catalog_compressed_path = output_dir.join(&catalog_artifact.asset);
     if fs::metadata(&catalog_compressed_path)?.len() != catalog_artifact.compressed_bytes
@@ -824,6 +1066,20 @@ fn validate_source_release(
             "SQLite source ownership set mismatch: expected {}, actual {}",
             expected.len(),
             actual.len()
+        );
+    }
+    let expected_memberships = expected_lift_station_memberships(dataset);
+    let mut actual_memberships = BTreeSet::new();
+    for plan in plans {
+        let path = staging.join(format!("{}.sqlite", plan.pack_id));
+        let connection = Connection::open(path)?;
+        collect_pack_lift_station_memberships(&connection, &mut actual_memberships)?;
+    }
+    if actual_memberships != expected_memberships {
+        bail!(
+            "SQLite lift station membership set mismatch: expected {}, actual {}",
+            expected_memberships.len(),
+            actual_memberships.len()
         );
     }
     Ok(())
@@ -852,6 +1108,32 @@ pub(super) fn validate_source_output(output_dir: &Path) -> Result<()> {
         .get("datasetVersion")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("source latest.json missing datasetVersion"))?;
+    let release_tag = latest
+        .get("releaseTag")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("source latest.json missing releaseTag"))?;
+    if release_tag != release_tag_for_dataset(dataset_version) {
+        bail!("source latest.json releaseTag does not match datasetVersion");
+    }
+    let pack_policy = latest
+        .get("packPolicy")
+        .ok_or_else(|| anyhow!("source latest.json missing packPolicy"))?;
+    if pack_policy
+        .get("estimatedTargetBytes")
+        .and_then(Value::as_u64)
+        != Some(SOURCE_PACK_TARGET_BYTES)
+        || pack_policy
+            .get("maxCompressedBytes")
+            .and_then(Value::as_u64)
+            != Some(SOURCE_PACK_MAX_COMPRESSED_BYTES)
+        || pack_policy
+            .get("combinedStandaloneMaxEstimatedBytes")
+            .and_then(Value::as_u64)
+            != Some(SOURCE_PACK_COMBINE_MAX_BYTES)
+        || pack_policy.get("gridDegrees").and_then(Value::as_f64) != Some(SOURCE_PACK_GRID_DEGREES)
+    {
+        bail!("source latest.json packPolicy mismatch");
+    }
     let catalog_metadata = latest
         .get("catalog")
         .ok_or_else(|| anyhow!("source latest.json missing catalog metadata"))?;
@@ -934,6 +1216,21 @@ pub(super) fn validate_source_output(output_dir: &Path) -> Result<()> {
         {
             bail!("source pack {} asset metadata mismatch", artifact.pack_id);
         }
+        if artifact.compressed_bytes > SOURCE_PACK_MAX_COMPRESSED_BYTES {
+            let resort_count: i64 = catalog.query_row(
+                "SELECT COUNT(DISTINCT resort_id) FROM resort_packs WHERE pack_id = ?1",
+                params![artifact.pack_id],
+                |row| row.get(0),
+            )?;
+            if resort_count != 1 {
+                bail!(
+                    "source pack {} compressed size {} exceeds the {} MiB source-pack ceiling",
+                    artifact.pack_id,
+                    artifact.compressed_bytes,
+                    SOURCE_PACK_MAX_COMPRESSED_BYTES / (1024 * 1024)
+                );
+            }
+        }
         let sqlite_path = validation_dir.join(format!("{}.sqlite", artifact.pack_id));
         gunzip_file(&compressed_path, &sqlite_path)?;
         if fs::metadata(&sqlite_path)?.len() != artifact.uncompressed_bytes {
@@ -983,6 +1280,10 @@ fn asset_path(output_dir: &Path, asset: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn release_tag_for_dataset(dataset_version: &str) -> String {
+    format!("indexes-{dataset_version}")
+}
+
 fn gunzip_file(source: &Path, destination: &Path) -> Result<()> {
     let input = File::open(source).with_context(|| format!("opening {}", source.display()))?;
     let mut decoder = GzDecoder::new(input);
@@ -1005,8 +1306,22 @@ fn validate_join_completeness(connection: &Connection) -> Result<()> {
         );
         let has_orphan: i64 = connection.query_row(&sql, [], |row| row.get(0))?;
         if has_orphan != 0 {
-            bail!("V2 source pack {table} contains an unowned feature");
+            bail!("V3 source pack {table} contains an unowned feature");
         }
+    }
+    let has_orphan: i64 = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM lift_station_memberships membership
+            LEFT JOIN spots station ON station.id = membership.station_id
+            LEFT JOIN lifts lift ON lift.id = membership.lift_id
+            WHERE station.id IS NULL OR lift.id IS NULL
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_orphan != 0 {
+        bail!("V3 source pack lift_station_memberships contains an orphan");
     }
     Ok(())
 }
@@ -1025,14 +1340,14 @@ fn validate_catalog_hierarchy(connection: &Connection) -> Result<()> {
     for (id, parent_id) in &rows {
         if let Some(parent_id) = parent_id {
             if parent_id == id || !ids.contains(parent_id.as_str()) {
-                bail!("V2 catalog has invalid parent for resort {id}");
+                bail!("V3 catalog has invalid parent for resort {id}");
             }
         }
         let mut path = BTreeSet::new();
         let mut current = Some(id.as_str());
         while let Some(current_id) = current {
             if !path.insert(current_id) {
-                bail!("V2 catalog hierarchy contains a cycle at {current_id}");
+                bail!("V3 catalog hierarchy contains a cycle at {current_id}");
             }
             current = rows
                 .iter()
@@ -1088,6 +1403,27 @@ fn expected_ownership(dataset: &NormalizedDataset) -> BTreeSet<OwnershipKey> {
     expected
 }
 
+fn expected_lift_station_memberships(
+    dataset: &NormalizedDataset,
+) -> BTreeSet<LiftStationMembershipKey> {
+    dataset
+        .lift_station_memberships
+        .iter()
+        .map(lift_station_membership_key)
+        .collect()
+}
+
+fn lift_station_membership_key(membership: &LiftStationMembership) -> LiftStationMembershipKey {
+    LiftStationMembershipKey {
+        station_id: membership.station_id.clone(),
+        lift_id: membership.lift_id.clone(),
+        source_node_id: membership.source_node_id.clone(),
+        contact_kind: membership.contact_kind.clone(),
+        contact_lon_bits: membership.contact[0].to_bits(),
+        contact_lat_bits: membership.contact[1].to_bits(),
+    }
+}
+
 fn add_ownership(
     feature_kind: &'static str,
     records: &[FeatureRecord],
@@ -1118,6 +1454,29 @@ fn collect_pack_ownership(
         "connection_id",
         output,
     )?;
+    Ok(())
+}
+
+fn collect_pack_lift_station_memberships(
+    connection: &Connection,
+    output: &mut BTreeSet<LiftStationMembershipKey>,
+) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT station_id, lift_id, source_node_id, contact_lon, contact_lat, contact_kind FROM lift_station_memberships",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(LiftStationMembershipKey {
+            station_id: row.get(0)?,
+            lift_id: row.get(1)?,
+            source_node_id: row.get(2)?,
+            contact_kind: row.get(5)?,
+            contact_lon_bits: row.get::<_, f64>(3)?.to_bits(),
+            contact_lat_bits: row.get::<_, f64>(4)?.to_bits(),
+        })
+    })?;
+    for row in rows {
+        output.insert(row?);
+    }
     Ok(())
 }
 

@@ -1,11 +1,12 @@
 use super::*;
 
-pub(super) fn normalize_sources(
+pub(super) fn normalize_sources_with_topology(
     ski_areas: Vec<SourceFeature>,
     runs: Vec<SourceFeature>,
     lifts: Vec<SourceFeature>,
     spots: Vec<SourceFeature>,
     connections: Vec<SourceFeature>,
+    station_topology: Vec<LiftStationTopology>,
     dataset_version: &str,
     generated_at: DateTime<Utc>,
 ) -> Result<NormalizedDataset> {
@@ -35,11 +36,6 @@ pub(super) fn normalize_sources(
         let iso_codes = iso_codes_from_places(feature.properties.get("places"));
         let country_codes = country_codes_from_places(feature.properties.get("places"));
         let country = country_codes.first().cloned();
-        let pack_group_hint = iso_codes
-            .first()
-            .cloned()
-            .or_else(|| country.clone())
-            .unwrap_or_else(|| "ZZ".to_string());
 
         resorts.push(ResortRecord {
             id: id.clone(),
@@ -49,7 +45,6 @@ pub(super) fn normalize_sources(
             area_km2: area_km2_from_bbox(bbox),
             country,
             iso_codes,
-            pack_group_hint,
             center,
             run_convention: first_string(&feature.properties, &["runConvention", "run_convention"]),
         });
@@ -165,7 +160,13 @@ pub(super) fn normalize_sources(
         &normalized_lifts,
         &mut warnings,
     );
-    let normalized_spots = assign_spots_to_resorts(spot_candidates, &resorts, &mut warnings);
+    let mut normalized_spots = assign_spots_to_resorts(spot_candidates, &resorts, &mut warnings);
+    let lift_station_memberships = normalize_lift_station_memberships(
+        &station_topology,
+        &mut normalized_spots,
+        &mut normalized_lifts,
+        &mut warnings,
+    );
 
     if resorts.is_empty() {
         bail!("no operating downhill resorts found; check OpenSkiMap schema and source files");
@@ -179,6 +180,7 @@ pub(super) fn normalize_sources(
         lifts: normalized_lifts,
         spots: normalized_spots,
         connections: normalized_connections,
+        lift_station_memberships,
     };
     validate_normalized_dataset(&dataset)?;
     Ok(dataset)
@@ -226,6 +228,50 @@ pub(super) fn validate_normalized_dataset(dataset: &NormalizedDataset) -> Result
     validate_feature_ownership("lift", &dataset.lifts, &resort_ids)?;
     validate_feature_ownership("spot", &dataset.spots, &resort_ids)?;
     validate_feature_ownership("connection", &dataset.connections, &resort_ids)?;
+
+    let spot_ids = dataset
+        .spots
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let lift_ids = dataset
+        .lifts
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut membership_keys = BTreeSet::new();
+    for membership in &dataset.lift_station_memberships {
+        if !spot_ids.contains(membership.station_id.as_str()) {
+            bail!(
+                "lift station membership references missing station {}",
+                membership.station_id
+            );
+        }
+        if !lift_ids.contains(membership.lift_id.as_str()) {
+            bail!(
+                "lift station membership references missing lift {}",
+                membership.lift_id
+            );
+        }
+        if !membership.contact[0].is_finite()
+            || !membership.contact[1].is_finite()
+            || !(-180.0..=180.0).contains(&membership.contact[0])
+            || !(-90.0..=90.0).contains(&membership.contact[1])
+        {
+            bail!(
+                "lift station membership {} -> {} has invalid contact coordinates",
+                membership.station_id,
+                membership.lift_id
+            );
+        }
+        if !membership_keys.insert((membership.station_id.as_str(), membership.lift_id.as_str())) {
+            bail!(
+                "duplicate lift station membership {} -> {}",
+                membership.station_id,
+                membership.lift_id
+            );
+        }
+    }
     Ok(())
 }
 
@@ -261,6 +307,169 @@ fn validate_feature_ownership(
         }
     }
     Ok(())
+}
+
+fn normalize_lift_station_memberships(
+    topologies: &[LiftStationTopology],
+    spots: &mut [FeatureRecord],
+    lifts: &mut [FeatureRecord],
+    warnings: &mut Vec<String>,
+) -> Vec<LiftStationMembership> {
+    let station_index = feature_source_index(spots);
+    let lift_index = feature_source_index(lifts);
+    let mut memberships_by_key = BTreeMap::new();
+
+    for topology in topologies {
+        let Some(station_id) = station_index.get(&topology.station_source).cloned() else {
+            warnings.push(format!(
+                "station topology {} skipped: no normalized station source match",
+                topology.station_source
+            ));
+            continue;
+        };
+        for member in &topology.members {
+            let Some(lift_id) = lift_index.get(&member.lift_source).cloned() else {
+                warnings.push(format!(
+                    "station topology {} -> {} skipped: no normalized lift source match",
+                    topology.station_source, member.lift_source
+                ));
+                continue;
+            };
+            let coordinate = member.coordinate;
+            if !coordinate[0].is_finite()
+                || !coordinate[1].is_finite()
+                || !(-180.0..=180.0).contains(&coordinate[0])
+                || !(-90.0..=90.0).contains(&coordinate[1])
+            {
+                warnings.push(format!(
+                    "station topology {} -> {} skipped: invalid contact coordinates",
+                    topology.station_source, member.lift_source
+                ));
+                continue;
+            }
+            let membership = LiftStationMembership {
+                station_id: station_id.clone(),
+                lift_id: lift_id.clone(),
+                source_node_id: Some(member.contact_node.clone()),
+                contact: coordinate,
+                contact_kind: member.contact_kind.clone(),
+            };
+            let key = (station_id.clone(), lift_id);
+            if let Some(existing) = memberships_by_key.get(&key) {
+                if existing != &membership {
+                    warnings.push(format!(
+                        "station topology {} -> {} has conflicting contacts; keeping the first",
+                        topology.station_source, member.lift_source
+                    ));
+                }
+            } else {
+                memberships_by_key.insert(key, membership);
+            }
+        }
+    }
+
+    let memberships = memberships_by_key.into_values().collect::<Vec<_>>();
+    share_lift_station_endpoint_ownership(&memberships, spots, lifts);
+
+    let mut lift_ids_by_station: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for membership in &memberships {
+        lift_ids_by_station
+            .entry(membership.station_id.clone())
+            .or_default()
+            .insert(membership.lift_id.clone());
+    }
+    for spot in spots {
+        let is_station = first_string(&spot.properties, &["spotType", "spot_type"])
+            .is_some_and(|spot_type| spot_type.eq_ignore_ascii_case("lift_station"))
+            || first_string(
+                &spot.properties,
+                &["station_type", "stationType", "position"],
+            )
+            .is_some();
+        if !is_station {
+            continue;
+        }
+        let connected_lift_count = lift_ids_by_station
+            .get(&spot.id)
+            .map_or(0, |lift_ids| lift_ids.len());
+        spot.properties.insert(
+            "isTransferStation".to_string(),
+            json!(connected_lift_count >= 2),
+        );
+        spot.properties
+            .insert("is_transfer".to_string(), json!(connected_lift_count >= 2));
+        spot.properties.insert(
+            "connectedLiftCount".to_string(),
+            json!(connected_lift_count),
+        );
+        spot.properties.insert(
+            "connected_lift_count".to_string(),
+            json!(connected_lift_count),
+        );
+    }
+
+    memberships
+}
+
+fn share_lift_station_endpoint_ownership(
+    memberships: &[LiftStationMembership],
+    spots: &mut [FeatureRecord],
+    lifts: &mut [FeatureRecord],
+) {
+    let station_indices = spots
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let lift_indices = lifts
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    // A topology edge is usable from either endpoint's resort scope. Propagate
+    // the complete owner set across each connected component so chained station
+    // memberships are deterministic and remain available in every relevant pack.
+    loop {
+        let mut changed = false;
+        for membership in memberships {
+            let Some(&station_index) = station_indices.get(&membership.station_id) else {
+                continue;
+            };
+            let Some(&lift_index) = lift_indices.get(&membership.lift_id) else {
+                continue;
+            };
+            let shared_owners = spots[station_index]
+                .resort_ids
+                .iter()
+                .chain(lifts[lift_index].resort_ids.iter())
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if spots[station_index].resort_ids != shared_owners {
+                spots[station_index].resort_ids = shared_owners.clone();
+                changed = true;
+            }
+            if lifts[lift_index].resort_ids != shared_owners {
+                lifts[lift_index].resort_ids = shared_owners;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn feature_source_index(records: &[FeatureRecord]) -> HashMap<String, String> {
+    let mut index = HashMap::new();
+    for record in records {
+        for source_key in source_keys_from_properties(&record.properties) {
+            index.entry(source_key).or_insert_with(|| record.id.clone());
+        }
+    }
+    index
 }
 
 pub(super) fn apply_feature_bounds_to_resorts(
@@ -677,6 +886,11 @@ pub(super) fn source_keys_from_properties(props: &Map<String, Value>) -> BTreeSe
     if let Some(source) = first_string(props, &["source"]) {
         if source.contains('/') {
             keys.insert(source);
+        }
+    }
+    if let Some(source_way_id) = first_string(props, &["sourceWayId", "source_way_id"]) {
+        if source_way_id.contains('/') {
+            keys.insert(source_way_id);
         }
     }
     if let (Some(osm_type), Some(osm_id)) = (
