@@ -137,7 +137,7 @@ Pull requests run Rust smoke checks only: build, tests, and CLI help. Manual dis
 4. When `publish_release` is enabled, upload the canonical SQLite catalog and source-pack assets.
 5. When `publish_release` is enabled, create or update the dataset's GitHub release.
 
-The workflow does not use `actions/cache` or `actions/upload-artifact`; generated data is deleted in the final cleanup step. The successful release job restores the shared parsed Overpass enrichment data from the rolling `overpass-cache` GitHub Release, then replaces that asset only after a validated published build. This is deliberately separate from the immutable dataset releases and keeps one persistent cache copy without Actions cache storage.
+The workflow does not use `actions/cache` or `actions/upload-artifact`; generated data is deleted in the final cleanup step. The job restores the shared parsed Overpass enrichment data from the rolling `overpass-cache` GitHub Release, then replaces that asset after a validated build even when `publish_release` is false. This is deliberately separate from the immutable dataset releases and keeps one persistent cache copy without Actions cache storage.
 
 The rolling cache contains parsed connection data and per-station topology entries with fetch timestamps. It is an indexer implementation detail, not an app asset; SkiNav downloads only the catalog and source packs.
 

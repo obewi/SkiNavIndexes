@@ -132,6 +132,14 @@ jobs:
           echo "pack_count=${pack_count}" >> "$GITHUB_OUTPUT"
           echo "timestamp=${timestamp}" >> "$GITHUB_OUTPUT"
 
+      - name: Package persistent Overpass cache
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf "$RUNNER_TEMP/overpass-cache.tar.gz" \
+            -C data/raw/openskimap/.overpass .
+
       - name: Prepare release assets
         if: steps.settings.outputs.publish_release == 'true'
         shell: bash
@@ -142,8 +150,7 @@ jobs:
           cp output/latest.json release/index/latest.json
           cp output/catalog.sqlite.gz release/index/catalog.sqlite.gz
           cp output/pack-*.sqlite.gz release/index/
-          tar -czf release/index/overpass-cache.tar.gz \
-            -C data/raw/openskimap/.overpass .
+          cp "$RUNNER_TEMP/overpass-cache.tar.gz" release/index/overpass-cache.tar.gz
           {
             echo "# SkiNavIndexes ${version}"
             echo
@@ -177,21 +184,22 @@ jobs:
             --target "$GITHUB_SHA"
 
       - name: Update persistent Overpass cache release
-        if: steps.settings.outputs.publish_release == 'true'
+        if: success()
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           cache_tag="overpass-cache"
+          archive="$RUNNER_TEMP/overpass-cache.tar.gz"
           if gh release view "$cache_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$cache_tag" \
-              release/index/overpass-cache.tar.gz \
+              "$archive" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber
           else
             gh release create "$cache_tag" \
-              release/index/overpass-cache.tar.gz \
+              "$archive" \
               --repo "$GITHUB_REPOSITORY" \
               --title "SkiNav Overpass enrichment cache" \
               --notes "Rolling persistent cache for successful SkiNavIndexes Overpass enrichment runs."
