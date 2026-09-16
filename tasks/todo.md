@@ -1,3 +1,50 @@
+# Per-scope source fingerprints and resilient Overpass enrichment (2026-09-16)
+
+## Mode
+
+- `implement`
+
+## Goal
+
+- Publish one compact, deterministic fingerprint for every resort's canonical
+  processing scope; reuse successful Overpass enrichment across dataset runs;
+  and expose the fingerprint in SkiNav diagnostics without automatic
+  reprocessing.
+
+## Constraints
+
+- Keep the fingerprint fixed-width and cheap to compare: versioned SHA-256,
+  first 128 bits, 32 lowercase hexadecimal characters.
+- Exclude release dates, dataset versions, generated timestamps, and pack
+  layout from the digest; repeat one scope value for every root/descendant
+  resort.
+- Use a rolling GitHub Release asset for persistent Overpass data, not
+  GitHub Actions cache storage.
+- Refresh per-station/connection entries after 120 days, pace and retry
+  requests, and preserve stale data when the affected result is cached.
+- Do not add mobile invalidation or automatic reprocessing in this slice.
+
+## Checklist
+
+- [x] Add producer fingerprints to `latest.json` and `catalog.sqlite`.
+- [x] Add persistent Overpass cache, bounded station batches, fallback
+  endpoints, retry/backoff, and release persistence.
+- [x] Add SkiNav backward-compatible decoding and debug-menu visibility.
+- [x] Verify Rust tests/formatting and the SkiNav simulator build; record the
+  existing app test-target compiler blocker.
+
+## Stop condition
+
+- Both repositories publish/consume the additive fingerprint contract, the
+  producer reuses cached Overpass data safely, and SkiNav shows the digest
+  without changing processing decisions.
+
+## Status
+
+- Complete for the producer contract, persistent cache, and SkiNav
+  compatibility/debug-only slice. Mobile reprocessing remains intentionally
+  deferred.
+
 ## App-Owned Render Detail Contract Cleanup (2026-06-06)
 
 ## Goal

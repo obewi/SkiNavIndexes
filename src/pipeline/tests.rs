@@ -58,6 +58,167 @@ fn stored_properties_prune_nested_assignment_properties() {
 }
 
 #[test]
+fn source_fingerprint_is_canonical_and_release_metadata_independent() -> Result<()> {
+    let first_properties = Value::Object(Map::from_iter([
+        ("name".to_string(), json!("Run A")),
+        (
+            "nested".to_string(),
+            Value::Object(Map::from_iter([
+                ("b".to_string(), json!(2)),
+                ("a".to_string(), json!(1)),
+            ])),
+        ),
+    ]));
+    let second_properties = Value::Object(Map::from_iter([
+        (
+            "nested".to_string(),
+            Value::Object(Map::from_iter([
+                ("a".to_string(), json!(1)),
+                ("b".to_string(), json!(2)),
+            ])),
+        ),
+        ("name".to_string(), json!("Run A")),
+    ]));
+    let first = NormalizedDataset {
+        dataset_version: "release-one".to_string(),
+        generated_at: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")?.with_timezone(&Utc),
+        resorts: vec![test_resort("resort", "Resort", "resort", None)],
+        runs: vec![
+            feature_record(
+                "run-b",
+                vec!["resort".to_string()],
+                json!({"name": "Run B"}),
+                json!({"type": "LineString", "coordinates": [[10.2, 46.0], [10.3, 46.0]]}),
+            ),
+            feature_record(
+                "run-a",
+                vec!["resort".to_string()],
+                first_properties,
+                json!({"type": "LineString", "coordinates": [[10.0, 46.0], [10.1, 46.0]]}),
+            ),
+        ],
+        lifts: Vec::new(),
+        spots: Vec::new(),
+        connections: Vec::new(),
+        lift_station_memberships: Vec::new(),
+    };
+    let second = NormalizedDataset {
+        dataset_version: "release-two".to_string(),
+        generated_at: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?.with_timezone(&Utc),
+        resorts: vec![test_resort("resort", "Resort", "resort", None)],
+        runs: vec![
+            feature_record(
+                "run-a",
+                vec!["resort".to_string()],
+                second_properties,
+                json!({"type": "LineString", "coordinates": [[10.0, 46.0], [10.1, 46.0]]}),
+            ),
+            feature_record(
+                "run-b",
+                vec!["resort".to_string()],
+                json!({"name": "Run B"}),
+                json!({"type": "LineString", "coordinates": [[10.2, 46.0], [10.3, 46.0]]}),
+            ),
+        ],
+        lifts: Vec::new(),
+        spots: Vec::new(),
+        connections: Vec::new(),
+        lift_station_memberships: Vec::new(),
+    };
+
+    let first_fingerprint = source_fingerprints_by_resort(&first)?["resort"].clone();
+    let second_fingerprint = source_fingerprints_by_resort(&second)?["resort"].clone();
+    assert_eq!(first_fingerprint, "2158d8d84b9bcd3ac1834d36430243d4");
+    assert_eq!(first_fingerprint, second_fingerprint);
+    assert_eq!(first_fingerprint.len(), SOURCE_FINGERPRINT_HEX_LENGTH);
+    assert!(
+        first_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    Ok(())
+}
+
+#[test]
+fn source_fingerprint_changes_for_semantic_normalized_content() -> Result<()> {
+    let geometry = json!({
+        "type": "LineString",
+        "coordinates": [[10.0, 46.0], [10.1, 46.0]]
+    });
+    let base = fingerprint_content_dataset(json!({"name": "Blue"}), geometry.clone());
+    let changed_property = fingerprint_content_dataset(json!({"name": "Red"}), geometry.clone());
+    let changed_geometry = fingerprint_content_dataset(
+        json!({"name": "Blue"}),
+        json!({
+            "type": "LineString",
+            "coordinates": [[10.0, 46.0], [10.2, 46.0]]
+        }),
+    );
+
+    let base_fingerprint = source_fingerprints_by_resort(&base)?["resort"].clone();
+    assert_ne!(
+        base_fingerprint,
+        source_fingerprints_by_resort(&changed_property)?["resort"]
+    );
+    assert_ne!(
+        base_fingerprint,
+        source_fingerprints_by_resort(&changed_geometry)?["resort"]
+    );
+    Ok(())
+}
+
+#[test]
+fn source_fingerprint_is_shared_by_hierarchy_and_isolated_between_scopes() -> Result<()> {
+    let base = fingerprint_scope_dataset(
+        json!({
+            "type": "LineString",
+            "coordinates": [[10.1, 46.1], [10.2, 46.2]]
+        }),
+        json!({
+            "type": "LineString",
+            "coordinates": [[11.1, 47.1], [11.2, 47.2]]
+        }),
+    );
+    let base_fingerprints = source_fingerprints_by_resort(&base)?;
+    assert_eq!(
+        base_fingerprints["root"], base_fingerprints["child"],
+        "all resorts in one processing scope must repeat its fingerprint"
+    );
+    assert_ne!(base_fingerprints["root"], base_fingerprints["other"]);
+
+    let unrelated_change = fingerprint_scope_dataset(
+        json!({
+            "type": "LineString",
+            "coordinates": [[10.1, 46.1], [10.2, 46.2]]
+        }),
+        json!({
+            "type": "LineString",
+            "coordinates": [[11.1, 47.1], [11.3, 47.3]]
+        }),
+    );
+    let unrelated_fingerprints = source_fingerprints_by_resort(&unrelated_change)?;
+    assert_eq!(base_fingerprints["root"], unrelated_fingerprints["root"]);
+    assert_eq!(base_fingerprints["child"], unrelated_fingerprints["child"]);
+    assert_ne!(base_fingerprints["other"], unrelated_fingerprints["other"]);
+
+    let child_change = fingerprint_scope_dataset(
+        json!({
+            "type": "LineString",
+            "coordinates": [[10.1, 46.1], [10.3, 46.3]]
+        }),
+        json!({
+            "type": "LineString",
+            "coordinates": [[11.1, 47.1], [11.2, 47.2]]
+        }),
+    );
+    let child_fingerprints = source_fingerprints_by_resort(&child_change)?;
+    assert_ne!(base_fingerprints["root"], child_fingerprints["root"]);
+    assert_ne!(base_fingerprints["child"], child_fingerprints["child"]);
+    assert_eq!(base_fingerprints["other"], child_fingerprints["other"]);
+    Ok(())
+}
+
+#[test]
 fn bbox_scans_nested_geojson_coordinates() {
     let geometry = json!({
         "type": "MultiLineString",
@@ -559,6 +720,357 @@ fn station_topology_fetch_rejects_runtime_error_before_cache_promotion() -> Resu
         "unexpected fetch error: {error:?}"
     );
     assert!(!cache.path().join(LIFT_STATION_TOPOLOGY_FILE).exists());
+    server.join().expect("Overpass fixture server thread")?;
+    Ok(())
+}
+
+#[test]
+fn overpass_endpoints_normalize_and_deduplicate_public_instances() {
+    assert_eq!(
+        overpass_interpreter_url("https://overpass-api.de/api/"),
+        "https://overpass-api.de/api/interpreter"
+    );
+    assert_eq!(
+        overpass_interpreter_url("https://overpass-api.de/api/interpreter"),
+        "https://overpass-api.de/api/interpreter"
+    );
+    assert_eq!(
+        overpass_endpoints("https://overpass-api.de/api/"),
+        vec![
+            "https://overpass-api.de/api/interpreter",
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+            "https://overpass.private.coffee/api/interpreter",
+            "https://overpass.osm.jp/api/interpreter"
+        ]
+    );
+    assert_eq!(
+        overpass_endpoints("http://127.0.0.1:12345/api/"),
+        vec!["http://127.0.0.1:12345/api/interpreter"]
+    );
+}
+
+#[test]
+fn overpass_endpoints_try_japanese_instance_after_existing_fallbacks() {
+    let endpoints = overpass_endpoints("https://overpass-api.de/api/");
+    let maps_mail_position = endpoints
+        .iter()
+        .position(|endpoint| endpoint == "https://maps.mail.ru/osm/tools/overpass/api/interpreter")
+        .expect("maps.mail.ru fallback");
+    let private_coffee_position = endpoints
+        .iter()
+        .position(|endpoint| endpoint == "https://overpass.private.coffee/api/interpreter")
+        .expect("private.coffee fallback");
+    let japanese_position = endpoints
+        .iter()
+        .position(|endpoint| endpoint == "https://overpass.osm.jp/api/interpreter")
+        .expect("Japanese fallback");
+
+    assert!(maps_mail_position < private_coffee_position);
+    assert!(private_coffee_position < japanese_position);
+    assert_eq!(
+        endpoints.last().map(String::as_str),
+        Some("https://overpass.osm.jp/api/interpreter")
+    );
+}
+
+#[test]
+fn write_json_atomically_creates_nested_parent_directory() -> Result<()> {
+    let cache = TempDir::new()?;
+    let path = cache
+        .path()
+        .join("nested")
+        .join(".overpass")
+        .join("cache.json");
+
+    write_json_atomically(&path, &json!({"elements": []}))?;
+
+    assert_eq!(read_json(&path)?, json!({"elements": []}));
+    assert!(!path.with_extension("json.part").exists());
+    Ok(())
+}
+
+#[test]
+fn overpass_request_retries_rate_limit_with_retry_after() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<Vec<String>> {
+        let mut requests = Vec::new();
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request)?;
+            requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+            let (status, headers, body) = if attempt == 0 {
+                ("429 Too Many Requests", "Retry-After: 0\r\n", "")
+            } else {
+                (
+                    "200 OK",
+                    "Content-Type: application/json\r\n",
+                    r#"{"elements":[]}"#,
+                )
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )?;
+            stream.flush()?;
+        }
+        Ok(requests)
+    });
+
+    let client = Client::builder().build()?;
+    let mut pacer = OverpassPacer::default();
+    let mut sleeps = Vec::new();
+    let mut sleep = |duration| sleeps.push(duration);
+    let response = overpass_request_with_fallback(
+        &client,
+        &format!("http://{address}/api/"),
+        "[out:json];node(1);out;",
+        "test",
+        &mut pacer,
+        &mut sleep,
+    )?;
+
+    assert_eq!(response.value["elements"], json!([]));
+    assert_eq!(
+        response.endpoint,
+        format!("http://{address}/api/interpreter")
+    );
+    let requests = server.join().expect("Overpass fixture server thread")?;
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        request.starts_with("POST /api/interpreter HTTP/") && request.contains("data=")
+    }));
+    assert!(sleeps.iter().any(|duration| *duration == Duration::ZERO));
+    Ok(())
+}
+
+#[test]
+fn station_topology_cache_reuses_fresh_and_refreshes_stale_stations() -> Result<()> {
+    let cache = TempDir::new()?;
+    let dataset_dir = cache.path().join("2026-09-16");
+    fs::create_dir_all(&dataset_dir)?;
+    write_json_pretty(
+        &dataset_dir.join("spots.geojson"),
+        &json!({
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "id": "station-1",
+                        "spotType": "lift_station",
+                        "sources": [{"id": "node/1", "type": "openstreetmap"}]
+                    },
+                    "geometry": {"type": "Point", "coordinates": [10.0, 46.0]}
+                },
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "id": "station-2",
+                        "spotType": "lift_station",
+                        "sources": [{"id": "node/2", "type": "openstreetmap"}]
+                    },
+                    "geometry": {"type": "Point", "coordinates": [10.1, 46.1]}
+                }
+            ]
+        }),
+    )?;
+    let now = Utc::now().timestamp();
+    let stale = now - 121 * 24 * 60 * 60;
+    write_json_pretty(
+        &overpass_station_cache_path(&dataset_dir),
+        &json!({
+            "schemaVersion": 1,
+            "stations": {
+                "node/1": {"fetchedAt": now, "members": []},
+                "node/2": {"fetchedAt": stale, "members": []}
+            }
+        }),
+    )?;
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<String> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = [0_u8; 8192];
+        let read = stream.read(&mut request)?;
+        let request = String::from_utf8_lossy(&request[..read]).into_owned();
+        let body = r#"{"elements":[{"type":"node","id":2,"lon":10.1,"lat":46.1,"tags":{"aerialway":"station"}}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
+        stream.flush()?;
+        Ok(request)
+    });
+
+    let client = Client::builder().build()?;
+    let result = fetch_or_extract_lift_station_topology(
+        &dataset_dir,
+        &format!("http://{address}/api/"),
+        &client,
+    )?;
+    assert_eq!(result["freshStationCount"], json!(1));
+    assert_eq!(result["staleStationCount"], json!(1));
+    assert_eq!(result["refreshedStationCount"], json!(1));
+    assert_eq!(result["queryCount"], json!(1));
+    let request = server.join().expect("Overpass fixture server thread")?;
+    assert!(request.contains("node%28id%3A2%29"));
+    assert!(!request.contains("node%28id%3A1%29"));
+
+    let output: Vec<LiftStationTopology> =
+        serde_json::from_value(read_json(&dataset_dir.join(LIFT_STATION_TOPOLOGY_FILE))?)?;
+    assert_eq!(
+        output
+            .iter()
+            .map(|topology| topology.station_source.as_str())
+            .collect::<Vec<_>>(),
+        vec!["node/1", "node/2"]
+    );
+    assert!(overpass_cache_entry_is_fresh(
+        now - 120 * 24 * 60 * 60 + 1,
+        now
+    ));
+    assert!(!overpass_cache_entry_is_fresh(
+        now - 120 * 24 * 60 * 60,
+        now
+    ));
+    Ok(())
+}
+
+#[test]
+fn station_topology_dataset_cache_promotes_newer_data_over_stale_persistent_entry() -> Result<()> {
+    let cache = TempDir::new()?;
+    let dataset_dir = cache.path().join("2026-09-16");
+    fs::create_dir_all(&dataset_dir)?;
+    write_json_pretty(
+        &dataset_dir.join("spots.geojson"),
+        &json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {
+                    "id": "station-7",
+                    "spotType": "lift_station",
+                    "sources": [{"id": "node/7", "type": "openstreetmap"}]
+                },
+                "geometry": {"type": "Point", "coordinates": [10.0, 46.0]}
+            }]
+        }),
+    )?;
+    write_json_atomically(
+        &dataset_dir.join(LIFT_STATION_TOPOLOGY_FILE),
+        &json!([{
+            "stationSource": "node/7",
+            "members": [{
+                "liftSource": "way/10",
+                "contactNode": "node/7",
+                "coordinate": [10.0, 46.0],
+                "contactKind": "station-node"
+            }]
+        }]),
+    )?;
+    let stale = Utc::now().timestamp() - 121 * 24 * 60 * 60;
+    write_json_atomically(
+        &overpass_station_cache_path(&dataset_dir),
+        &json!({
+            "schemaVersion": 1,
+            "stations": {
+                "node/7": {
+                    "fetchedAt": stale,
+                    "members": [{
+                        "liftSource": "way/9",
+                        "contactNode": "node/7",
+                        "coordinate": [10.0, 46.0],
+                        "contactKind": "station-node"
+                    }]
+                }
+            }
+        }),
+    )?;
+
+    let client = Client::builder().build()?;
+    let result =
+        fetch_or_extract_lift_station_topology(&dataset_dir, "http://127.0.0.1:1/api/", &client)?;
+
+    assert_eq!(result["status"], json!("cached"));
+    assert_eq!(result["queryCount"], json!(0));
+    let output: Vec<LiftStationTopology> =
+        serde_json::from_value(read_json(&dataset_dir.join(LIFT_STATION_TOPOLOGY_FILE))?)?;
+    assert_eq!(output[0].members[0].lift_source, "way/10");
+    Ok(())
+}
+
+#[test]
+fn station_topology_refresh_keeps_stale_data_when_overpass_fails() -> Result<()> {
+    let cache = TempDir::new()?;
+    let dataset_dir = cache.path().join("2026-09-16");
+    fs::create_dir_all(&dataset_dir)?;
+    write_json_pretty(
+        &dataset_dir.join("spots.geojson"),
+        &json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {
+                    "id": "station-7",
+                    "spotType": "lift_station",
+                    "sources": [{"id": "node/7", "type": "openstreetmap"}]
+                },
+                "geometry": {"type": "Point", "coordinates": [10.0, 46.0]}
+            }]
+        }),
+    )?;
+    let stale = Utc::now().timestamp() - 121 * 24 * 60 * 60;
+    write_json_pretty(
+        &overpass_station_cache_path(&dataset_dir),
+        &json!({
+            "schemaVersion": 1,
+            "stations": {
+                "node/7": {
+                    "fetchedAt": stale,
+                    "members": [{
+                        "liftSource": "way/9",
+                        "contactNode": "node/7",
+                        "coordinate": [10.0, 46.0],
+                        "contactKind": "station-node"
+                    }]
+                }
+            }
+        }),
+    )?;
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = [0_u8; 8192];
+        let _ = stream.read(&mut request)?;
+        let body = r#"{"remark":"runtime error: Query timed out","elements":[]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
+        stream.flush()?;
+        Ok(())
+    });
+
+    let client = Client::builder().build()?;
+    let result = fetch_or_extract_lift_station_topology(
+        &dataset_dir,
+        &format!("http://{address}/api/"),
+        &client,
+    )?;
+    assert_eq!(result["status"], json!("stale-cache"));
+    let output: Vec<LiftStationTopology> =
+        serde_json::from_value(read_json(&dataset_dir.join(LIFT_STATION_TOPOLOGY_FILE))?)?;
+    assert_eq!(output[0].members[0].lift_source, "way/9");
     server.join().expect("Overpass fixture server thread")?;
     Ok(())
 }
@@ -1114,6 +1626,77 @@ fn build_pipeline_writes_only_canonical_sqlite_output() -> Result<()> {
             .and_then(Value::as_u64),
         Some(8 * 1024 * 1024)
     );
+
+    let fingerprint_contract = latest
+        .get("sourceFingerprint")
+        .expect("source fingerprint contract");
+    assert_eq!(
+        fingerprint_contract
+            .get("algorithm")
+            .and_then(Value::as_str),
+        Some("sha256")
+    );
+    assert_eq!(
+        fingerprint_contract.get("version").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        fingerprint_contract
+            .get("truncationBits")
+            .and_then(Value::as_i64),
+        Some(128)
+    );
+    assert_eq!(
+        fingerprint_contract.get("encoding").and_then(Value::as_str),
+        Some("lowercase-hex")
+    );
+    assert_eq!(
+        fingerprint_contract
+            .get("hexLength")
+            .and_then(Value::as_u64),
+        Some(32)
+    );
+
+    let catalog_dir = unpack_gzip_asset(output.path(), "catalog.sqlite.gz")?;
+    let catalog = Connection::open(catalog_dir.path().join("catalog.sqlite"))?;
+    for (key, expected) in [
+        ("sourceFingerprintAlgorithm", "sha256"),
+        ("sourceFingerprintVersion", "1"),
+        ("sourceFingerprintTruncationBits", "128"),
+        ("sourceFingerprintEncoding", "lowercase-hex"),
+        ("sourceFingerprintHexLength", "32"),
+    ] {
+        let actual: String =
+            catalog.query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(actual, expected, "metadata key {key}");
+    }
+    let catalog_fingerprint: String = catalog.query_row(
+        "SELECT source_fingerprint FROM resorts WHERE id = ?1",
+        ["area-1"],
+        |row| row.get(0),
+    )?;
+    assert_eq!(catalog_fingerprint.len(), 32);
+    assert!(
+        catalog_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    let source_fingerprint_column: (String, String, i64, Option<String>) = catalog.query_row(
+        "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('resorts') WHERE name = 'source_fingerprint'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(
+        source_fingerprint_column,
+        (
+            "source_fingerprint".to_string(),
+            "TEXT".to_string(),
+            1,
+            None
+        )
+    );
     Ok(())
 }
 
@@ -1187,5 +1770,65 @@ fn feature_record(
         resort_ids,
         properties: properties.as_object().cloned().unwrap_or_default(),
         geometry,
+    }
+}
+
+fn fingerprint_content_dataset(properties: Value, geometry: Value) -> NormalizedDataset {
+    NormalizedDataset {
+        dataset_version: "2026-09-10".to_string(),
+        generated_at: Utc::now(),
+        resorts: vec![test_resort("resort", "Resort", "resort", None)],
+        runs: vec![feature_record(
+            "run",
+            vec!["resort".to_string()],
+            properties,
+            geometry,
+        )],
+        lifts: Vec::new(),
+        spots: Vec::new(),
+        connections: Vec::new(),
+        lift_station_memberships: Vec::new(),
+    }
+}
+
+fn fingerprint_scope_dataset(
+    child_geometry: Value,
+    unrelated_geometry: Value,
+) -> NormalizedDataset {
+    NormalizedDataset {
+        dataset_version: "2026-09-10".to_string(),
+        generated_at: Utc::now(),
+        resorts: vec![
+            test_resort("root", "Root", "domain", None),
+            test_resort("child", "Child", "resort", Some("root")),
+            test_resort("other", "Other", "resort", None),
+        ],
+        runs: vec![
+            feature_record(
+                "root-run",
+                vec!["root".to_string()],
+                json!({"name": "Root run"}),
+                json!({
+                    "type": "LineString",
+                    "coordinates": [[10.0, 46.0], [10.1, 46.1]]
+                }),
+            ),
+            feature_record(
+                "child-run",
+                vec!["child".to_string()],
+                json!({"name": "Child run"}),
+                child_geometry,
+            ),
+            feature_record(
+                "other-run",
+                vec!["other".to_string()],
+                json!({"name": "Other run"}),
+                unrelated_geometry,
+            ),
+        ],
+        lifts: Vec::new(),
+        spots: Vec::new(),
+        connections: Vec::new(),
+        lift_station_memberships: Vec::new(),
     }
 }

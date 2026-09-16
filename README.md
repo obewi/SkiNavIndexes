@@ -109,7 +109,7 @@ output/
 Key files:
 
 - `latest.json` is the stable app entrypoint. It identifies the schema, dataset, immutable GitHub release tag, pack policy, and verified `catalog.sqlite.gz` metadata.
-- `catalog.sqlite.gz` contains resort hierarchy, names, ISO metadata, source-pack references, and per-resort source statistics.
+- `catalog.sqlite.gz` contains resort hierarchy, names, ISO metadata, source-pack references, per-resort source statistics, and one `source_fingerprint` per resort. The fingerprint is exactly 32 lowercase hexadecimal characters: the first 128 bits of a versioned SHA-256 digest over the normalized source content for that resort's canonical root-plus-descendants processing scope. Its algorithm, version, encoding, and width are declared once in `latest.json` and catalog metadata. It excludes the release date, dataset version, generated timestamp, and pack layout, so equal source content compares equal across releases. Every resort in one processing scope repeats the same value.
 - `pack-*.sqlite.gz` contains normalized source feature tables and explicit ownership join tables. A resort can reference more than one pack, and a feature can be owned by more than one resort.
 
 Pack planning is hierarchy-aware and deterministic. A canonical root and all of its
@@ -137,7 +137,11 @@ Pull requests run Rust smoke checks only: build, tests, and CLI help. Manual dis
 4. When `publish_release` is enabled, upload the canonical SQLite catalog and source-pack assets.
 5. When `publish_release` is enabled, create or update the dataset's GitHub release.
 
-The workflow does not use `actions/cache` or `actions/upload-artifact`; generated data is deleted in the final cleanup step. GitHub still retains workflow logs and run metadata according to the repository's Actions retention settings, and the published release assets are intentionally stored as GitHub Release assets for SkiNav to download.
+The workflow does not use `actions/cache` or `actions/upload-artifact`; generated data is deleted in the final cleanup step. The successful release job restores the shared parsed Overpass enrichment data from the rolling `overpass-cache` GitHub Release, then replaces that asset only after a validated published build. This is deliberately separate from the immutable dataset releases and keeps one persistent cache copy without Actions cache storage.
+
+The rolling cache contains parsed connection data and per-station topology entries with fetch timestamps. It is an indexer implementation detail, not an app asset; SkiNav downloads only the catalog and source packs.
+
+The persistent cache is stored at `data/raw/openskimap/.overpass/` and is refreshed per station or connection after 120 days. Station topology requests are bounded to batches of 200 station source IDs. The default request order is `overpass-api.de`, `maps.mail.ru`, `private.coffee`, then `overpass.osm.jp`; requests are paced and can use stale cached entries when all affected data is already available.
 
 The public release contract is the root-level `latest.json`, `catalog.sqlite.gz`, and `pack-*.sqlite.gz` assets. The release tag in `latest.json` is the immutable tag used for the catalog and pack asset URLs; clients do not resolve individual assets through a moving `releases/latest` URL. The publishing workflow refuses to mutate an existing release tag.
 

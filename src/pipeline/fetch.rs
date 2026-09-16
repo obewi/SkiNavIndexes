@@ -1,5 +1,314 @@
 use super::*;
 
+pub(super) const OVERPASS_CACHE_DIRECTORY: &str = ".overpass";
+pub(super) const OVERPASS_STATION_CACHE_FILE: &str = "lift_station_topology_cache.json";
+pub(super) const OVERPASS_CONNECTION_CACHE_FILE: &str = "connections_cache.json";
+const OVERPASS_CACHE_SCHEMA_VERSION: u8 = 1;
+const OVERPASS_CACHE_STALE_AFTER_DAYS: i64 = 120;
+const OVERPASS_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
+const OVERPASS_MAX_RETRY_ROUNDS: usize = 2;
+const OVERPASS_RETRY_DELAY: Duration = Duration::from_secs(5);
+const OVERPASS_RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
+const OVERPASS_DEFAULT_ENDPOINT: &str = "https://overpass-api.de/api/interpreter";
+const OVERPASS_FALLBACK_ENDPOINTS: [&str; 3] = [
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.osm.jp/api/interpreter",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedStationTopology {
+    fetched_at: i64,
+    members: Vec<LiftStationTopologyMember>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentStationTopologyCache {
+    schema_version: u8,
+    stations: BTreeMap<String, CachedStationTopology>,
+}
+
+impl Default for PersistentStationTopologyCache {
+    fn default() -> Self {
+        Self {
+            schema_version: OVERPASS_CACHE_SCHEMA_VERSION,
+            stations: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct OverpassResponse {
+    pub(super) endpoint: String,
+    pub(super) value: Value,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct OverpassPacer {
+    last_request: Option<std::time::Instant>,
+}
+
+impl OverpassPacer {
+    fn wait(&mut self, sleep: &mut dyn FnMut(Duration)) {
+        if let Some(last_request) = self.last_request {
+            let elapsed = last_request.elapsed();
+            if elapsed < OVERPASS_REQUEST_INTERVAL {
+                sleep(OVERPASS_REQUEST_INTERVAL - elapsed);
+            }
+        }
+        self.last_request = Some(std::time::Instant::now());
+    }
+}
+
+pub(super) fn overpass_cache_dir(dataset_dir: &Path) -> PathBuf {
+    dataset_dir
+        .parent()
+        .unwrap_or(dataset_dir)
+        .join(OVERPASS_CACHE_DIRECTORY)
+}
+
+pub(super) fn overpass_station_cache_path(dataset_dir: &Path) -> PathBuf {
+    overpass_cache_dir(dataset_dir).join(OVERPASS_STATION_CACHE_FILE)
+}
+
+pub(super) fn overpass_connection_cache_path(dataset_dir: &Path) -> PathBuf {
+    overpass_cache_dir(dataset_dir).join(OVERPASS_CONNECTION_CACHE_FILE)
+}
+
+pub(super) fn overpass_interpreter_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return OVERPASS_DEFAULT_ENDPOINT.to_string();
+    }
+    if trimmed.ends_with("/interpreter") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/interpreter")
+    }
+}
+
+pub(super) fn overpass_endpoints(preferred_base_url: &str) -> Vec<String> {
+    let preferred = overpass_interpreter_url(preferred_base_url);
+    let public_endpoints = std::iter::once(OVERPASS_DEFAULT_ENDPOINT)
+        .chain(OVERPASS_FALLBACK_ENDPOINTS)
+        .collect::<Vec<_>>();
+
+    if public_endpoints
+        .iter()
+        .any(|endpoint| *endpoint == preferred)
+    {
+        let mut endpoints = vec![preferred.clone()];
+        endpoints.extend(
+            public_endpoints
+                .into_iter()
+                .filter(|endpoint| *endpoint != preferred)
+                .map(str::to_string),
+        );
+        endpoints
+    } else {
+        vec![preferred]
+    }
+}
+
+pub(super) fn overpass_request_with_fallback(
+    client: &Client,
+    preferred_base_url: &str,
+    query: &str,
+    operation: &str,
+    pacer: &mut OverpassPacer,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<OverpassResponse> {
+    let mut errors = Vec::new();
+
+    for round in 0..OVERPASS_MAX_RETRY_ROUNDS {
+        let mut transient_failure = false;
+        let mut rate_limit_delay = None;
+
+        for endpoint in overpass_endpoints(preferred_base_url) {
+            pacer.wait(sleep);
+            eprintln!("Querying Overpass {operation}: {endpoint}");
+            let response = match client.post(&endpoint).form(&[("data", query)]).send() {
+                Ok(response) => response,
+                Err(error) => {
+                    transient_failure = true;
+                    errors.push(format!("{endpoint}: {error}"));
+                    continue;
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                let body = match response.text() {
+                    Ok(body) => body,
+                    Err(error) => {
+                        transient_failure = true;
+                        errors.push(format!("{endpoint}: reading response body: {error}"));
+                        continue;
+                    }
+                };
+                match parse_overpass_json(&body) {
+                    Ok(value) if value.get("elements").is_some_and(Value::is_array) => {
+                        return Ok(OverpassResponse { endpoint, value });
+                    }
+                    Ok(_) => errors.push(format!("{endpoint}: response missing elements array")),
+                    Err(error) => errors.push(format!("{endpoint}: {error}")),
+                }
+                continue;
+            }
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                transient_failure = true;
+                let delay = overpass_retry_after(&response).unwrap_or(OVERPASS_RATE_LIMIT_DELAY);
+                rate_limit_delay =
+                    Some(rate_limit_delay.map_or(delay, |current: Duration| current.max(delay)));
+                errors.push(format!("{endpoint}: HTTP {status}"));
+                continue;
+            }
+
+            if status.is_client_error() {
+                bail!("Overpass {operation} failed at {endpoint}: HTTP {status}");
+            }
+
+            if status.is_server_error()
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_EARLY
+            {
+                transient_failure = true;
+            }
+            errors.push(format!("{endpoint}: HTTP {status}"));
+        }
+
+        if !transient_failure || round + 1 == OVERPASS_MAX_RETRY_ROUNDS {
+            break;
+        }
+
+        let delay = rate_limit_delay.unwrap_or(OVERPASS_RETRY_DELAY);
+        eprintln!(
+            "All Overpass endpoints failed for {operation}; retrying after {} seconds",
+            delay.as_secs()
+        );
+        sleep(delay);
+    }
+
+    bail!(
+        "Overpass {operation} failed across configured endpoints: {}",
+        errors.join("; ")
+    )
+}
+
+fn overpass_retry_after(response: &reqwest::blocking::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+pub(super) fn overpass_cache_entry_is_fresh(fetched_at: i64, now: i64) -> bool {
+    now.saturating_sub(fetched_at) < OVERPASS_CACHE_STALE_AFTER_DAYS.saturating_mul(24 * 60 * 60)
+}
+
+fn read_station_topology_cache(path: &Path) -> Result<PersistentStationTopologyCache> {
+    let value = read_json(path)?;
+    let cache: PersistentStationTopologyCache =
+        serde_json::from_value(value).with_context(|| {
+            format!(
+                "parsing persistent station topology cache {}",
+                path.display()
+            )
+        })?;
+    if cache.schema_version != OVERPASS_CACHE_SCHEMA_VERSION {
+        bail!(
+            "unsupported persistent station topology cache version {} in {}",
+            cache.schema_version,
+            path.display()
+        );
+    }
+    Ok(cache)
+}
+
+fn write_station_topology_cache(path: &Path, cache: &PersistentStationTopologyCache) -> Result<()> {
+    write_json_atomically(path, &serde_json::to_value(cache)?)
+}
+
+fn read_connection_cache(path: &Path) -> Result<(i64, Value)> {
+    let value = read_json(path)?;
+    let schema_version = value
+        .get("schemaVersion")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("connection cache missing schemaVersion"))?;
+    if schema_version != u64::from(OVERPASS_CACHE_SCHEMA_VERSION) {
+        bail!("unsupported connection cache version {schema_version}");
+    }
+    let fetched_at = value
+        .get("fetchedAt")
+        .cloned()
+        .ok_or_else(|| anyhow!("connection cache missing fetchedAt"))?
+        .as_i64()
+        .ok_or_else(|| anyhow!("connection cache fetchedAt is not an integer"))?;
+    let data = value
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow!("connection cache missing data"))?;
+    validate_geojson_value(&data)?;
+    Ok((fetched_at, data))
+}
+
+fn write_connection_cache(path: &Path, fetched_at: i64, data: &Value) -> Result<()> {
+    write_json_atomically(
+        path,
+        &json!({
+            "schemaVersion": OVERPASS_CACHE_SCHEMA_VERSION,
+            "fetchedAt": fetched_at,
+            "data": data,
+        }),
+    )
+}
+
+pub(super) fn write_json_atomically(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating cache directory {}", parent.display()))?;
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!("{extension}.part"))
+        .unwrap_or_else(|| "part".to_string());
+    let temp = path.with_extension(extension);
+    write_json_pretty(&temp, value)?;
+    fs::rename(&temp, path)
+        .with_context(|| format!("moving {} to {}", temp.display(), path.display()))?;
+    Ok(())
+}
+
+fn validate_geojson_value(value: &Value) -> Result<()> {
+    if value.get("type").and_then(Value::as_str) != Some("FeatureCollection") {
+        bail!("expected GeoJSON FeatureCollection");
+    }
+    if !value.get("features").is_some_and(Value::is_array) {
+        bail!("expected features array");
+    }
+    Ok(())
+}
+
+fn file_modified_at(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_else(|| {
+            Utc::now().timestamp() - (OVERPASS_CACHE_STALE_AFTER_DAYS + 1) * 24 * 60 * 60
+        })
+}
+
 pub(super) fn fetch_sources(
     cache_dir: &Path,
     dataset_version: Option<String>,
@@ -95,92 +404,200 @@ pub(super) fn fetch_or_extract_lift_station_topology(
     client: &Client,
 ) -> Result<Value> {
     let target = dataset_dir.join(LIFT_STATION_TOPOLOGY_FILE);
+    let station_sources = station_source_ids_from_spots(dataset_dir)?;
+    let cache_path = overpass_station_cache_path(dataset_dir);
+    let mut cache = if cache_path.exists() {
+        match read_station_topology_cache(&cache_path) {
+            Ok(cache) => cache,
+            Err(error) => {
+                eprintln!(
+                    "Ignoring invalid persistent station topology cache {}: {error:#}",
+                    cache_path.display()
+                );
+                PersistentStationTopologyCache::default()
+            }
+        }
+    } else {
+        PersistentStationTopologyCache::default()
+    };
+
     if target.exists() {
-        let topologies = read_lift_station_topology(&target)?;
-        let summary = topology_summary(&topologies);
-        return Ok(json!({
-            "name": LIFT_STATION_TOPOLOGY_FILE,
-            "status": "cached",
-            "stationCount": summary.station_count,
-            "featureCount": summary.membership_count,
-            "metadata": file_metadata(LIFT_STATION_TOPOLOGY_FILE, &target, None)?
-        }));
+        let fetched_at = file_modified_at(&target);
+        for topology in read_lift_station_topology(&target)? {
+            let should_replace = cache
+                .stations
+                .get(&topology.station_source)
+                .is_none_or(|entry| entry.fetched_at < fetched_at);
+            if should_replace {
+                cache.stations.insert(
+                    topology.station_source,
+                    CachedStationTopology {
+                        fetched_at,
+                        members: topology.members,
+                    },
+                );
+            }
+        }
+        write_station_topology_cache(&cache_path, &cache)?;
     }
 
-    let station_sources = station_source_ids_from_spots(dataset_dir)?;
-    let mut memberships: BTreeMap<(String, String), LiftStationTopologyMember> = BTreeMap::new();
+    let now = Utc::now().timestamp();
+    let missing_station_count = station_sources
+        .iter()
+        .filter(|source| !cache.stations.contains_key(*source))
+        .count();
+    let stale_station_count = station_sources
+        .iter()
+        .filter(|source| {
+            cache
+                .stations
+                .get(*source)
+                .is_some_and(|entry| !overpass_cache_entry_is_fresh(entry.fetched_at, now))
+        })
+        .count();
+    let fresh_station_count = station_sources.len() - missing_station_count - stale_station_count;
+    let refresh_sources = station_sources
+        .iter()
+        .filter(|source| {
+            cache
+                .stations
+                .get(*source)
+                .is_none_or(|entry| !overpass_cache_entry_is_fresh(entry.fetched_at, now))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut pacer = OverpassPacer::default();
+    let mut sleep = |duration| std::thread::sleep(duration);
+    let mut preferred_endpoint = overpass_base_url.to_string();
     let mut query_hashes = Vec::new();
-    for batch in station_sources.chunks(LIFT_STATION_TOPOLOGY_BATCH_SIZE) {
+    let mut query_count = 0;
+    let mut refreshed_station_count = 0;
+    let mut stale_fallback_station_count = 0;
+    let mut refresh_blocked = false;
+    for batch in refresh_sources.chunks(LIFT_STATION_TOPOLOGY_BATCH_SIZE) {
+        if refresh_blocked {
+            if batch
+                .iter()
+                .any(|source| !cache.stations.contains_key(source))
+            {
+                bail!(
+                    "Overpass station topology refresh was unavailable and {} station(s) have no cached result",
+                    batch.len()
+                );
+            }
+            stale_fallback_station_count += batch.len();
+            continue;
+        }
+
         let query = overpass_lift_station_topology_query(batch);
         query_hashes.push(sha256_text(query.as_str()));
-        let url = format!("{}/interpreter", overpass_base_url.trim_end_matches('/'));
-        eprintln!(
-            "Querying bounded lift-station topology for {} station source IDs: {url}",
-            batch.len()
-        );
-        let response = client
-            .post(&url)
-            .form(&[("data", query.as_str())])
-            .send()
-            .with_context(|| format!("querying Overpass station topology {url}"))?;
-        if !response.status().is_success() {
-            bail!(
-                "Overpass station topology query failed: HTTP {}",
-                response.status()
-            );
-        }
-        let body = response
-            .text()
-            .context("reading Overpass station topology response body")?;
-        let overpass =
-            parse_overpass_json(&body).context("parsing Overpass station topology response")?;
-        let (topologies, _) = overpass_json_to_lift_station_topology(&overpass, batch)?;
-        for topology in topologies {
-            for member in topology.members {
-                let key = (topology.station_source.clone(), member.lift_source.clone());
-                if let Some(existing) = memberships.get(&key) {
-                    if existing != &member {
-                        bail!(
-                            "conflicting station topology contact for {} -> {}",
-                            key.0,
-                            key.1
-                        );
-                    }
-                } else {
-                    memberships.insert(key, member);
+        query_count += 1;
+        match overpass_request_with_fallback(
+            client,
+            &preferred_endpoint,
+            &query,
+            "station topology",
+            &mut pacer,
+            &mut sleep,
+        ) {
+            Ok(response) => {
+                let (topologies, _) =
+                    overpass_json_to_lift_station_topology(&response.value, batch)?;
+                if topologies.len() != batch.len() {
+                    bail!(
+                        "Overpass station topology response returned {} of {} requested stations",
+                        topologies.len(),
+                        batch.len()
+                    );
                 }
+                for topology in topologies {
+                    cache.stations.insert(
+                        topology.station_source,
+                        CachedStationTopology {
+                            fetched_at: now,
+                            members: topology.members,
+                        },
+                    );
+                }
+                write_station_topology_cache(&cache_path, &cache)?;
+                refreshed_station_count += batch.len();
+                preferred_endpoint = response.endpoint;
+            }
+            Err(error) => {
+                if batch
+                    .iter()
+                    .any(|source| !cache.stations.contains_key(source))
+                {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "querying station topology for {} station source IDs",
+                            batch.len()
+                        )
+                    });
+                }
+                eprintln!(
+                    "Using stale station topology cache for {} station source IDs: {error:#}",
+                    batch.len()
+                );
+                stale_fallback_station_count += batch.len();
+                refresh_blocked = true;
             }
         }
     }
 
     let topologies = station_sources
-        .into_iter()
-        .map(|station_source| LiftStationTopology {
-            station_source: station_source.clone(),
-            members: memberships
-                .iter()
-                .filter(|((source, _), _)| source == &station_source)
-                .map(|(_, member)| member.clone())
-                .collect(),
+        .iter()
+        .map(|station_source| {
+            let members = cache
+                .stations
+                .get(station_source)
+                .ok_or_else(|| anyhow!("station topology cache missing {station_source}"))?
+                .members
+                .clone();
+            Ok(LiftStationTopology {
+                station_source: station_source.clone(),
+                members,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let summary = topology_summary(&topologies);
     let value = serde_json::to_value(&topologies)?;
-    let temp = target.with_extension("json.part");
-    write_json_pretty(&temp, &value)?;
-    fs::rename(&temp, &target)
-        .with_context(|| format!("moving {} to {}", temp.display(), target.display()))?;
-
-    let url = format!("{}/interpreter", overpass_base_url.trim_end_matches('/'));
+    write_json_atomically(&target, &value)?;
+    let status = if query_count == 0 {
+        "cached"
+    } else if refreshed_station_count == 0 {
+        "stale-cache"
+    } else if stale_fallback_station_count > 0 {
+        "overpass-with-stale-fallback"
+    } else {
+        "overpass"
+    };
+    let metadata_url = (query_count > 0).then(|| overpass_interpreter_url(&preferred_endpoint));
+    let url = metadata_url
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
     Ok(json!({
         "name": LIFT_STATION_TOPOLOGY_FILE,
-        "status": "overpass",
+        "status": status,
         "url": url,
-        "querySha256": sha256_text(&query_hashes.join("\n")),
+        "querySha256": if query_hashes.is_empty() {
+            Value::Null
+        } else {
+            Value::String(sha256_text(&query_hashes.join("\n")))
+        },
         "fetchedAt": Utc::now(),
         "stationCount": summary.station_count,
         "featureCount": summary.membership_count,
-        "metadata": file_metadata(LIFT_STATION_TOPOLOGY_FILE, &target, Some(url))?
+        "freshStationCount": fresh_station_count,
+        "staleStationCount": stale_station_count,
+        "missingStationCount": missing_station_count,
+        "refreshedStationCount": refreshed_station_count,
+        "staleFallbackStationCount": stale_fallback_station_count,
+        "queryCount": query_count,
+        "persistentCachePath": cache_path,
+        "metadata": file_metadata(LIFT_STATION_TOPOLOGY_FILE, &target, metadata_url)?
     }))
 }
 
@@ -426,37 +843,81 @@ pub(super) fn fetch_or_extract_connections(
         }));
     }
 
-    let query = overpass_connection_query();
-    let url = format!("{}/interpreter", overpass_base_url.trim_end_matches('/'));
-    eprintln!("OpenSkiMap has no type=connection features; querying Overpass: {url}");
-    let response = client
-        .post(&url)
-        .form(&[("data", query.as_str())])
-        .send()
-        .with_context(|| format!("querying Overpass {url}"))?;
-    if !response.status().is_success() {
-        bail!(
-            "Overpass connection query failed: HTTP {}",
-            response.status()
-        );
+    let persistent_cache_path = overpass_connection_cache_path(dataset_dir);
+    let persistent_cache = if persistent_cache_path.exists() {
+        match read_connection_cache(&persistent_cache_path) {
+            Ok(cache) => Some(cache),
+            Err(error) => {
+                eprintln!(
+                    "Ignoring invalid persistent connection cache {}: {error:#}",
+                    persistent_cache_path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let now = Utc::now().timestamp();
+    if let Some((fetched_at, connections)) = &persistent_cache {
+        if overpass_cache_entry_is_fresh(*fetched_at, now) {
+            write_json_atomically(&target, connections)?;
+            let metadata = file_metadata(CONNECTIONS_FILE, &target, None)?;
+            return Ok(json!({
+                "name": CONNECTIONS_FILE,
+                "status": "cached",
+                "source": "persistent-overpass-cache",
+                "fetchedAt": fetched_at,
+                "persistentCachePath": persistent_cache_path,
+                "metadata": metadata
+            }));
+        }
     }
-    let body = response.text().context("reading Overpass response body")?;
-    let overpass = parse_overpass_json(&body).context("parsing Overpass response")?;
-    let (connections, summary) = overpass_json_to_connection_geojson(&overpass)?;
-    let temp = target.with_extension("geojson.part");
-    write_json_pretty(&temp, &connections)?;
-    validate_geojson_file(&temp)?;
-    fs::rename(&temp, &target)
-        .with_context(|| format!("moving {} to {}", temp.display(), target.display()))?;
+
+    let query = overpass_connection_query();
+    let mut pacer = OverpassPacer::default();
+    let mut sleep = |duration| std::thread::sleep(duration);
+    let response = match overpass_request_with_fallback(
+        client,
+        overpass_base_url,
+        &query,
+        "connection enrichment",
+        &mut pacer,
+        &mut sleep,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some((fetched_at, connections)) = &persistent_cache {
+                eprintln!("Using stale connection cache after Overpass failure: {error:#}");
+                write_json_atomically(&target, connections)?;
+                let metadata = file_metadata(CONNECTIONS_FILE, &target, None)?;
+                return Ok(json!({
+                    "name": CONNECTIONS_FILE,
+                    "status": "stale-cache",
+                    "source": "persistent-overpass-cache",
+                    "error": error.to_string(),
+                    "fetchedAt": fetched_at,
+                    "persistentCachePath": persistent_cache_path,
+                    "metadata": metadata
+                }));
+            }
+            return Err(error).context("querying Overpass connection enrichment");
+        }
+    };
+    let (connections, summary) = overpass_json_to_connection_geojson(&response.value)?;
+    let endpoint = response.endpoint;
+    write_connection_cache(&persistent_cache_path, now, &connections)?;
+    write_json_atomically(&target, &connections)?;
     Ok(json!({
         "name": CONNECTIONS_FILE,
         "status": "overpass",
-        "url": url,
+        "url": endpoint.clone(),
         "querySha256": sha256_text(query.as_str()),
         "fetchedAt": Utc::now(),
         "featureCount": summary.feature_count,
         "ignoredElementCount": summary.ignored_count,
-        "metadata": file_metadata(CONNECTIONS_FILE, &target, Some(url))?
+        "persistentCachePath": persistent_cache_path,
+        "metadata": file_metadata(CONNECTIONS_FILE, &target, Some(endpoint))?
     }))
 }
 

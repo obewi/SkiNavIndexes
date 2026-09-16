@@ -87,6 +87,26 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
 
+      - name: Restore persistent Overpass enrichment cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_dir="data/raw/openskimap/.overpass"
+          archive="$RUNNER_TEMP/overpass-cache.tar.gz"
+          mkdir -p "$cache_dir"
+          if gh release download overpass-cache \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern overpass-cache.tar.gz \
+              --dir "$RUNNER_TEMP" \
+              --clobber; then
+            tar -xzf "$archive" -C "$cache_dir"
+            echo "Restored persistent Overpass cache"
+          else
+            echo "No persistent Overpass cache release exists yet"
+          fi
+
       - name: Build, validate, and package from OpenSkiMap GeoJSON
         run: |
           cargo run --release --locked -- all --dataset-version "${{ steps.settings.outputs.dataset_version }}"
@@ -122,6 +142,8 @@ jobs:
           cp output/latest.json release/index/latest.json
           cp output/catalog.sqlite.gz release/index/catalog.sqlite.gz
           cp output/pack-*.sqlite.gz release/index/
+          tar -czf release/index/overpass-cache.tar.gz \
+            -C data/raw/openskimap/.overpass .
           {
             echo "# SkiNavIndexes ${version}"
             echo
@@ -153,6 +175,27 @@ jobs:
             --title "$title" \
             --notes-file release/RELEASE_NOTES.md \
             --target "$GITHUB_SHA"
+
+      - name: Update persistent Overpass cache release
+        if: steps.settings.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_tag="overpass-cache"
+          if gh release view "$cache_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$cache_tag" \
+              release/index/overpass-cache.tar.gz \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$cache_tag" \
+              release/index/overpass-cache.tar.gz \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "SkiNav Overpass enrichment cache" \
+              --notes "Rolling persistent cache for successful SkiNavIndexes Overpass enrichment runs."
+          fi
 
       - name: Update root latest.json entrypoint
         if: github.ref_name == github.event.repository.default_branch && steps.settings.outputs.publish_release == 'true'

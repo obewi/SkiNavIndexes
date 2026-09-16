@@ -1,5 +1,12 @@
 # Lessons
 
+# 2026-09-16
+
+- A per-resort source identity should be a fixed-size, versioned digest of
+  normalized semantic content, independent of release timestamps and pack
+  layout. Compute it once per canonical processing scope and repeat it for
+  descendants so comparisons stay cheap and storage stays bounded.
+
 ## 2026-09-10
 
 - A format migration is incomplete while the old producer or consumer remains reachable. When SQLite becomes the source of truth, remove the V1 generator, cache, decoder, and fallback in the same change; do not leave V2 under a nested candidate directory.

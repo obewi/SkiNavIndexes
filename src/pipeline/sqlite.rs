@@ -86,6 +86,7 @@ pub(super) fn write_source_outputs(output_dir: &Path, dataset: &NormalizedDatase
     }
     fs::create_dir_all(&staging)?;
 
+    let fingerprints_by_resort_id = source_fingerprints_by_resort(dataset)?;
     let plans = plan_source_packs(dataset)?;
     let mut pack_artifacts = Vec::with_capacity(plans.len());
     for plan in &plans {
@@ -105,7 +106,13 @@ pub(super) fn write_source_outputs(output_dir: &Path, dataset: &NormalizedDatase
     }
 
     let catalog_path = staging.join("catalog.sqlite");
-    write_catalog(&catalog_path, dataset, &plans, &pack_artifacts)?;
+    write_catalog(
+        &catalog_path,
+        dataset,
+        &plans,
+        &pack_artifacts,
+        &fingerprints_by_resort_id,
+    )?;
     let catalog_asset = "catalog.sqlite.gz";
     let catalog_compressed_path = output_dir.join(catalog_asset);
     gzip_file(&catalog_path, &catalog_compressed_path)?;
@@ -124,12 +131,20 @@ pub(super) fn write_source_outputs(output_dir: &Path, dataset: &NormalizedDatase
         &plans,
         &pack_artifacts,
         &catalog_artifact,
+        &fingerprints_by_resort_id,
     )?;
 
     let latest = json!({
         "schemaVersion": SOURCE_SCHEMA_VERSION,
         "datasetVersion": dataset.dataset_version,
         "releaseTag": release_tag_for_dataset(&dataset.dataset_version),
+        "sourceFingerprint": {
+            "algorithm": SOURCE_FINGERPRINT_ALGORITHM,
+            "version": SOURCE_FINGERPRINT_VERSION,
+            "truncationBits": SOURCE_FINGERPRINT_TRUNCATION_BITS,
+            "encoding": SOURCE_FINGERPRINT_ENCODING,
+            "hexLength": SOURCE_FINGERPRINT_HEX_LENGTH
+        },
         "packPolicy": {
             "estimatedTargetBytes": SOURCE_PACK_TARGET_BYTES,
             "maxCompressedBytes": SOURCE_PACK_MAX_COMPRESSED_BYTES,
@@ -146,6 +161,41 @@ pub(super) fn write_source_outputs(output_dir: &Path, dataset: &NormalizedDatase
     write_json_pretty(&output_dir.join("latest.json"), &latest)?;
     fs::remove_dir_all(&staging)?;
     Ok(())
+}
+
+pub(super) fn source_fingerprints_by_resort(
+    dataset: &NormalizedDataset,
+) -> Result<BTreeMap<String, String>> {
+    let resorts_by_id = dataset
+        .resorts
+        .iter()
+        .map(|resort| (resort.id.as_str(), resort))
+        .collect::<BTreeMap<_, _>>();
+    let mut root_by_resort_id = BTreeMap::new();
+    let mut resort_ids_by_root = BTreeMap::<String, BTreeSet<String>>::new();
+    for resort in &dataset.resorts {
+        let root_id = canonical_root_resort_id(resort.id.as_str(), &resorts_by_id)?;
+        root_by_resort_id.insert(resort.id.clone(), root_id.clone());
+        resort_ids_by_root
+            .entry(root_id)
+            .or_default()
+            .insert(resort.id.clone());
+    }
+
+    let fingerprints_by_root = source_scope_fingerprints(dataset, &resort_ids_by_root)?;
+    dataset
+        .resorts
+        .iter()
+        .map(|resort| {
+            let root_id = root_by_resort_id
+                .get(&resort.id)
+                .ok_or_else(|| anyhow!("missing processing root for resort {}", resort.id))?;
+            let fingerprint = fingerprints_by_root
+                .get(root_id)
+                .ok_or_else(|| anyhow!("missing processing fingerprint for root {root_id}"))?;
+            Ok((resort.id.clone(), fingerprint.clone()))
+        })
+        .collect()
 }
 
 pub(super) fn plan_source_packs(dataset: &NormalizedDataset) -> Result<Vec<SourcePackPlan>> {
@@ -820,6 +870,7 @@ fn write_catalog(
     dataset: &NormalizedDataset,
     plans: &[SourcePackPlan],
     pack_artifacts: &[PackArtifact],
+    fingerprints_by_resort_id: &BTreeMap<String, String>,
 ) -> Result<()> {
     let mut connection = Connection::open(path)?;
     configure_database(&connection)?;
@@ -832,12 +883,35 @@ fn write_catalog(
             ("datasetVersion", dataset.dataset_version.clone()),
             ("generatedAt", dataset.generated_at.to_rfc3339()),
             ("packCount", plans.len().to_string()),
+            (
+                "sourceFingerprintAlgorithm",
+                SOURCE_FINGERPRINT_ALGORITHM.to_string(),
+            ),
+            (
+                "sourceFingerprintVersion",
+                SOURCE_FINGERPRINT_VERSION.to_string(),
+            ),
+            (
+                "sourceFingerprintTruncationBits",
+                SOURCE_FINGERPRINT_TRUNCATION_BITS.to_string(),
+            ),
+            (
+                "sourceFingerprintEncoding",
+                SOURCE_FINGERPRINT_ENCODING.to_string(),
+            ),
+            (
+                "sourceFingerprintHexLength",
+                SOURCE_FINGERPRINT_HEX_LENGTH.to_string(),
+            ),
         ],
     )?;
 
     for resort in &dataset.resorts {
+        let source_fingerprint = fingerprints_by_resort_id
+            .get(&resort.id)
+            .ok_or_else(|| anyhow!("missing source fingerprint for resort {}", resort.id))?;
         transaction.execute(
-            "INSERT INTO resorts (id, name, parent_id, bbox_west, bbox_south, bbox_east, bbox_north, center_lon, center_lat, country, run_convention) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO resorts (id, name, parent_id, bbox_west, bbox_south, bbox_east, bbox_north, center_lon, center_lat, country, run_convention, source_fingerprint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 resort.id,
                 resort.name,
@@ -850,6 +924,7 @@ fn write_catalog(
                 resort.center[1],
                 resort.country,
                 resort.run_convention,
+                source_fingerprint,
             ],
         )?;
         for iso_code in &resort.iso_codes {
@@ -912,7 +987,12 @@ fn create_catalog_schema(connection: &Connection) -> Result<()> {
             center_lon REAL NOT NULL,
             center_lat REAL NOT NULL,
             country TEXT,
-            run_convention TEXT
+            run_convention TEXT,
+            source_fingerprint TEXT NOT NULL
+                CHECK (
+                    length(source_fingerprint) = 32
+                    AND source_fingerprint NOT GLOB '*[^0-9a-f]*'
+                )
         );
         CREATE TABLE resort_iso_codes (
             resort_id TEXT NOT NULL REFERENCES resorts(id) ON DELETE CASCADE,
@@ -955,6 +1035,83 @@ fn insert_metadata(transaction: &Transaction<'_>, entries: &[(&str, String)]) ->
     Ok(())
 }
 
+fn validate_latest_fingerprint_metadata(value: &Value) -> Result<()> {
+    if value.get("algorithm").and_then(Value::as_str) != Some(SOURCE_FINGERPRINT_ALGORITHM)
+        || value.get("version").and_then(Value::as_i64) != Some(SOURCE_FINGERPRINT_VERSION)
+        || value.get("truncationBits").and_then(Value::as_i64)
+            != Some(SOURCE_FINGERPRINT_TRUNCATION_BITS)
+        || value.get("encoding").and_then(Value::as_str) != Some(SOURCE_FINGERPRINT_ENCODING)
+        || value.get("hexLength").and_then(Value::as_u64)
+            != Some(SOURCE_FINGERPRINT_HEX_LENGTH as u64)
+    {
+        bail!("source latest.json sourceFingerprint metadata mismatch");
+    }
+    Ok(())
+}
+
+fn validate_catalog_fingerprint_metadata(connection: &Connection) -> Result<()> {
+    let expected_version = SOURCE_FINGERPRINT_VERSION.to_string();
+    let expected_truncation_bits = SOURCE_FINGERPRINT_TRUNCATION_BITS.to_string();
+    let expected_hex_length = SOURCE_FINGERPRINT_HEX_LENGTH.to_string();
+    for (key, expected) in [
+        ("sourceFingerprintAlgorithm", SOURCE_FINGERPRINT_ALGORITHM),
+        ("sourceFingerprintVersion", expected_version.as_str()),
+        (
+            "sourceFingerprintTruncationBits",
+            expected_truncation_bits.as_str(),
+        ),
+        ("sourceFingerprintEncoding", SOURCE_FINGERPRINT_ENCODING),
+        ("sourceFingerprintHexLength", expected_hex_length.as_str()),
+    ] {
+        if metadata_value(connection, key)?.as_deref() != Some(expected) {
+            bail!("catalog {key} metadata mismatch");
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_fingerprints(
+    connection: &Connection,
+    expected: &BTreeMap<String, String>,
+) -> Result<()> {
+    let actual = catalog_fingerprint_rows(connection)?;
+    if actual
+        .values()
+        .any(|value| !is_processing_fingerprint(value))
+    {
+        bail!("catalog contains an invalid processing fingerprint");
+    }
+    if &actual != expected {
+        bail!("catalog processing fingerprints do not match normalized scopes");
+    }
+    Ok(())
+}
+
+fn validate_catalog_fingerprint_shape(connection: &Connection) -> Result<()> {
+    let actual = catalog_fingerprint_rows(connection)?;
+    if actual
+        .values()
+        .any(|value| !is_processing_fingerprint(value))
+    {
+        bail!("catalog contains an invalid processing fingerprint");
+    }
+    Ok(())
+}
+
+fn catalog_fingerprint_rows(connection: &Connection) -> Result<BTreeMap<String, String>> {
+    Ok(connection
+        .prepare("SELECT id, source_fingerprint FROM resorts ORDER BY id")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+}
+
+fn is_processing_fingerprint(value: &str) -> bool {
+    value.len() == SOURCE_FINGERPRINT_HEX_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn count_owned(records: &[FeatureRecord], resort_id: &str) -> usize {
     records
         .iter()
@@ -969,6 +1126,7 @@ fn validate_source_release(
     plans: &[SourcePackPlan],
     pack_artifacts: &[PackArtifact],
     catalog_artifact: &PackArtifact,
+    fingerprints_by_resort_id: &BTreeMap<String, String>,
 ) -> Result<()> {
     let catalog_path = staging.join("catalog.sqlite");
     validate_database(&catalog_path)?;
@@ -984,6 +1142,8 @@ fn validate_source_release(
     {
         bail!("catalog datasetVersion mismatch");
     }
+    validate_catalog_fingerprint_metadata(&catalog)?;
+    validate_catalog_fingerprints(&catalog, fingerprints_by_resort_id)?;
 
     let expected_pack_ids = plans
         .iter()
@@ -1134,6 +1294,11 @@ pub(super) fn validate_source_output(output_dir: &Path) -> Result<()> {
     {
         bail!("source latest.json packPolicy mismatch");
     }
+    validate_latest_fingerprint_metadata(
+        latest
+            .get("sourceFingerprint")
+            .ok_or_else(|| anyhow!("source latest.json missing sourceFingerprint"))?,
+    )?;
     let catalog_metadata = latest
         .get("catalog")
         .ok_or_else(|| anyhow!("source latest.json missing catalog metadata"))?;
@@ -1171,6 +1336,8 @@ pub(super) fn validate_source_output(output_dir: &Path) -> Result<()> {
     if metadata_value(&catalog, "datasetVersion")?.as_deref() != Some(dataset_version) {
         bail!("source catalog datasetVersion mismatch");
     }
+    validate_catalog_fingerprint_metadata(&catalog)?;
+    validate_catalog_fingerprint_shape(&catalog)?;
 
     let catalog_uncompressed_bytes = fs::metadata(&catalog_path)?.len();
     if catalog_metadata
@@ -1514,7 +1681,7 @@ fn gzip_file(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn geometry_to_wkb(geometry: &Value) -> Result<Vec<u8>> {
+pub(super) fn geometry_to_wkb(geometry: &Value) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     write_wkb_geometry(&mut output, geometry)?;
     Ok(output)
