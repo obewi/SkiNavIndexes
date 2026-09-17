@@ -116,11 +116,14 @@ Key files:
 - `pack-*.sqlite.gz` contains normalized source feature tables and explicit ownership join tables. A resort can reference more than one pack, and a feature can be owned by more than one resort.
 
 Pack planning is hierarchy-aware and deterministic. A canonical root and all of its
-descendants stay together when they fit the estimated 16 MiB budget. Larger roots are
-split into root-local packs and are never mixed with another root. Small standalone
-roots may share a pack only with geographically nearby standalone roots in the same
-2° grid cell. Generated output is checked against an 8 MiB compressed ceiling for
-normal packs; an intrinsically oversized single-resort pack is the only exception.
+descendants stay together when they fit the estimated 28 MiB budget. Larger roots are
+split into root-local packs and are never mixed with another root. Roots whose complete
+hierarchy fits the budget are combined in an adaptive quadtree: a world-sized leaf is
+split into four children only when its estimated payload exceeds the budget, so sparse
+regions share packs while busy regions get smaller geographic leaves. A depth-limited
+size fallback keeps the partition deterministic when many roots share the same
+location. Generated output is checked against a 12 MiB compressed ceiling for normal
+packs; an intrinsically oversized single-resort pack is the only exception.
 
 There is no generated discovery JSON, JSON schema, per-resort package tree, group archive, release-pack tarball, or nested `output/v2/` candidate. `latest.json` is metadata only; resort search and future catalog statistics come from SQLite.
 

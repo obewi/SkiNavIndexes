@@ -8,13 +8,74 @@ use std::{
 };
 
 const SOURCE_SCHEMA_VERSION: i64 = 3;
-// The planner estimates compact row payloads. Keeping the estimate at 16 MiB
+// The planner estimates compact row payloads. Keeping the estimate at 28 MiB
 // leaves room for SQLite pages, indexes, and gzip variance while keeping normal
-// downloads below the 8 MiB compressed ceiling on the published snapshot.
-const SOURCE_PACK_TARGET_BYTES: u64 = 16 * 1024 * 1024;
-const SOURCE_PACK_MAX_COMPRESSED_BYTES: u64 = 8 * 1024 * 1024;
-const SOURCE_PACK_COMBINE_MAX_BYTES: u64 = 2 * 1024 * 1024;
-const SOURCE_PACK_GRID_DEGREES: f64 = 2.0;
+// downloads below the 12 MiB compressed ceiling on the published snapshot.
+pub(super) const SOURCE_PACK_TARGET_BYTES: u64 = 28 * 1024 * 1024;
+const SOURCE_PACK_MAX_COMPRESSED_BYTES: u64 = 12 * 1024 * 1024;
+const SOURCE_PACK_PARTITION: &str = "adaptive-quadtree";
+const SOURCE_PACK_MAX_QUADTREE_DEPTH: u8 = 16;
+
+#[derive(Clone, Copy, Debug)]
+struct SpatialBounds {
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+}
+
+impl SpatialBounds {
+    fn world() -> Self {
+        Self {
+            west: -180.0,
+            south: -90.0,
+            east: 180.0,
+            north: 90.0,
+        }
+    }
+
+    fn quadrants(self) -> [Self; 4] {
+        let midpoint_lon = (self.west + self.east) / 2.0;
+        let midpoint_lat = (self.south + self.north) / 2.0;
+        [
+            Self {
+                west: self.west,
+                south: self.south,
+                east: midpoint_lon,
+                north: midpoint_lat,
+            },
+            Self {
+                west: midpoint_lon,
+                south: self.south,
+                east: self.east,
+                north: midpoint_lat,
+            },
+            Self {
+                west: self.west,
+                south: midpoint_lat,
+                east: midpoint_lon,
+                north: self.north,
+            },
+            Self {
+                west: midpoint_lon,
+                south: midpoint_lat,
+                east: self.east,
+                north: self.north,
+            },
+        ]
+    }
+
+    fn quadrant_index(self, location: [f64; 2]) -> usize {
+        let east = location[0] >= (self.west + self.east) / 2.0;
+        let north = location[1] >= (self.south + self.north) / 2.0;
+        match (north, east) {
+            (false, false) => 0,
+            (false, true) => 1,
+            (true, false) => 2,
+            (true, true) => 3,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct SourcePackPlan {
@@ -148,8 +209,8 @@ pub(super) fn write_source_outputs(output_dir: &Path, dataset: &NormalizedDatase
         "packPolicy": {
             "estimatedTargetBytes": SOURCE_PACK_TARGET_BYTES,
             "maxCompressedBytes": SOURCE_PACK_MAX_COMPRESSED_BYTES,
-            "combinedStandaloneMaxEstimatedBytes": SOURCE_PACK_COMBINE_MAX_BYTES,
-            "gridDegrees": SOURCE_PACK_GRID_DEGREES
+            "partition": SOURCE_PACK_PARTITION,
+            "maxQuadtreeDepth": SOURCE_PACK_MAX_QUADTREE_DEPTH
         },
         "catalog": {
             "asset": catalog_artifact.asset,
@@ -211,11 +272,13 @@ pub(super) fn plan_source_packs(dataset: &NormalizedDataset) -> Result<Vec<Sourc
     }
 
     let mut fixed_units = Vec::new();
-    let mut combinable_units: BTreeMap<(i32, i32), Vec<PackUnit>> = BTreeMap::new();
+    let mut adaptive_units = Vec::new();
     for (root_id, mut members) in members_by_root {
         members.sort_by(|lhs, rhs| lhs.id.cmp(&rhs.id));
         let root_location = members
-            .first()
+            .iter()
+            .find(|resort| resort.id == root_id)
+            .or_else(|| members.first())
             .map(|resort| resort.center)
             .unwrap_or([0.0, 0.0]);
         let estimates = members
@@ -225,7 +288,6 @@ pub(super) fn plan_source_packs(dataset: &NormalizedDataset) -> Result<Vec<Sourc
         let total_estimate = estimates.iter().copied().fold(0_u64, u64::saturating_add);
 
         if total_estimate <= SOURCE_PACK_TARGET_BYTES {
-            let can_combine = members.len() == 1 && total_estimate <= SOURCE_PACK_COMBINE_MAX_BYTES;
             let unit = PackUnit {
                 resort_ids: members.iter().map(|resort| resort.id.clone()).collect(),
                 estimated_bytes: total_estimate,
@@ -233,14 +295,7 @@ pub(super) fn plan_source_packs(dataset: &NormalizedDataset) -> Result<Vec<Sourc
                 location: root_location,
                 allows_oversized: false,
             };
-            if can_combine {
-                combinable_units
-                    .entry(spatial_cell(unit.location))
-                    .or_default()
-                    .push(unit);
-            } else {
-                fixed_units.push(unit);
-            }
+            adaptive_units.push(unit);
             continue;
         }
 
@@ -275,32 +330,14 @@ pub(super) fn plan_source_packs(dataset: &NormalizedDataset) -> Result<Vec<Sourc
         }
     }
 
-    for (_cell, mut units) in combinable_units {
-        units.sort_by(|lhs, rhs| lhs.sort_key.cmp(&rhs.sort_key));
-        let mut current = None;
-        for unit in units {
-            let should_flush = current.as_ref().is_some_and(|current: &PackUnit| {
-                current.estimated_bytes.saturating_add(unit.estimated_bytes)
-                    > SOURCE_PACK_TARGET_BYTES
-            });
-            if should_flush {
-                fixed_units.push(current.take().expect("current standalone pack unit"));
-            }
-            if let Some(current) = current.as_mut() {
-                current.resort_ids.extend(unit.resort_ids);
-                current.estimated_bytes =
-                    current.estimated_bytes.saturating_add(unit.estimated_bytes);
-                if unit.sort_key.as_str() < current.sort_key.as_str() {
-                    current.sort_key = unit.sort_key;
-                }
-            } else {
-                current = Some(unit);
-            }
-        }
-        if let Some(unit) = current {
-            fixed_units.push(unit);
-        }
-    }
+    let mut adaptive_packs = Vec::new();
+    partition_adaptive_units(
+        adaptive_units,
+        SpatialBounds::world(),
+        0,
+        &mut adaptive_packs,
+    );
+    coalesce_adaptive_units(adaptive_packs, &mut fixed_units);
 
     fixed_units.sort_by(|lhs, rhs| {
         lhs.sort_key
@@ -362,14 +399,103 @@ fn canonical_root_resort_id(
     bail!("resort hierarchy is missing resort {resort_id}")
 }
 
-fn spatial_cell(center: [f64; 2]) -> (i32, i32) {
-    (
-        ((center[0] + 180.0) / SOURCE_PACK_GRID_DEGREES).floor() as i32,
-        ((center[1] + 90.0) / SOURCE_PACK_GRID_DEGREES).floor() as i32,
-    )
+fn partition_adaptive_units(
+    units: Vec<PackUnit>,
+    bounds: SpatialBounds,
+    depth: u8,
+    output: &mut Vec<PackUnit>,
+) {
+    if units.is_empty() {
+        return;
+    }
+
+    let total_estimate = units
+        .iter()
+        .map(|unit| unit.estimated_bytes)
+        .fold(0_u64, u64::saturating_add);
+    if total_estimate <= SOURCE_PACK_TARGET_BYTES || units.len() == 1 {
+        output.push(combine_pack_units(units));
+        return;
+    }
+
+    if depth >= SOURCE_PACK_MAX_QUADTREE_DEPTH {
+        append_size_bounded_units(units, output);
+        return;
+    }
+
+    let quadrants = bounds.quadrants();
+    let mut buckets = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for unit in units {
+        let index = bounds.quadrant_index(unit.location);
+        buckets[index].push(unit);
+    }
+    for (index, bucket) in buckets.into_iter().enumerate() {
+        partition_adaptive_units(bucket, quadrants[index], depth + 1, output);
+    }
 }
 
-fn estimate_resort_source_bytes(dataset: &NormalizedDataset, resort: &ResortRecord) -> Result<u64> {
+fn append_size_bounded_units(mut units: Vec<PackUnit>, output: &mut Vec<PackUnit>) {
+    units.sort_by(|lhs, rhs| lhs.sort_key.cmp(&rhs.sort_key));
+    let mut current = Vec::new();
+    let mut current_estimate = 0_u64;
+    for unit in units {
+        if !current.is_empty()
+            && current_estimate.saturating_add(unit.estimated_bytes) > SOURCE_PACK_TARGET_BYTES
+        {
+            output.push(combine_pack_units(std::mem::take(&mut current)));
+            current_estimate = 0;
+        }
+        current_estimate = current_estimate.saturating_add(unit.estimated_bytes);
+        current.push(unit);
+    }
+    if !current.is_empty() {
+        output.push(combine_pack_units(current));
+    }
+}
+
+fn coalesce_adaptive_units(units: Vec<PackUnit>, output: &mut Vec<PackUnit>) {
+    let mut current = Vec::new();
+    let mut current_estimate = 0_u64;
+    for unit in units {
+        if !current.is_empty()
+            && current_estimate.saturating_add(unit.estimated_bytes) > SOURCE_PACK_TARGET_BYTES
+        {
+            output.push(combine_pack_units(std::mem::take(&mut current)));
+            current_estimate = 0;
+        }
+        current_estimate = current_estimate.saturating_add(unit.estimated_bytes);
+        current.push(unit);
+    }
+    if !current.is_empty() {
+        output.push(combine_pack_units(current));
+    }
+}
+
+fn combine_pack_units(mut units: Vec<PackUnit>) -> PackUnit {
+    debug_assert!(!units.is_empty());
+    units.sort_by(|lhs, rhs| lhs.sort_key.cmp(&rhs.sort_key));
+    let mut units = units.into_iter();
+    let mut combined = units
+        .next()
+        .expect("pack unit collection must not be empty");
+    for unit in units {
+        combined.resort_ids.extend(unit.resort_ids);
+        combined.estimated_bytes = combined
+            .estimated_bytes
+            .saturating_add(unit.estimated_bytes);
+        if unit.sort_key < combined.sort_key {
+            combined.sort_key = unit.sort_key;
+        }
+        combined.allows_oversized |= unit.allows_oversized;
+    }
+    combined.resort_ids.sort();
+    combined
+}
+
+pub(super) fn estimate_resort_source_bytes(
+    dataset: &NormalizedDataset,
+    resort: &ResortRecord,
+) -> Result<u64> {
     let mut size = 2048_u64;
     for record in dataset
         .runs
@@ -1286,11 +1412,9 @@ pub(super) fn validate_source_output(output_dir: &Path) -> Result<()> {
             .get("maxCompressedBytes")
             .and_then(Value::as_u64)
             != Some(SOURCE_PACK_MAX_COMPRESSED_BYTES)
-        || pack_policy
-            .get("combinedStandaloneMaxEstimatedBytes")
-            .and_then(Value::as_u64)
-            != Some(SOURCE_PACK_COMBINE_MAX_BYTES)
-        || pack_policy.get("gridDegrees").and_then(Value::as_f64) != Some(SOURCE_PACK_GRID_DEGREES)
+        || pack_policy.get("partition").and_then(Value::as_str) != Some(SOURCE_PACK_PARTITION)
+        || pack_policy.get("maxQuadtreeDepth").and_then(Value::as_u64)
+            != Some(SOURCE_PACK_MAX_QUADTREE_DEPTH as u64)
     {
         bail!("source latest.json packPolicy mismatch");
     }

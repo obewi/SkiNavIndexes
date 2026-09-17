@@ -436,8 +436,7 @@ fn parent_owned_features_survive_hierarchy_normalization_and_sqlite_output() -> 
 }
 
 #[test]
-fn source_pack_planner_keeps_hierarchy_local_and_combines_nearby_standalone_resorts() -> Result<()>
-{
+fn source_pack_planner_keeps_hierarchy_together_and_combines_nearby_resorts() -> Result<()> {
     let mut domain = test_resort("domain", "Domain", "domain", None);
     domain.center = [10.0, 46.0];
     let mut child = test_resort("child", "Child", "resort", Some("domain"));
@@ -463,8 +462,8 @@ fn source_pack_planner_keeps_hierarchy_local_and_combines_nearby_standalone_reso
         .iter()
         .find(|plan| plan.resort_ids.iter().any(|id| id == "domain"))
         .expect("hierarchy pack");
-    assert_eq!(hierarchy_plan.resort_ids, vec!["child", "domain"]);
-    assert!(!hierarchy_plan.resort_ids.iter().any(|id| id == "nearby-a"));
+    assert!(hierarchy_plan.resort_ids.iter().any(|id| id == "child"));
+    assert!(hierarchy_plan.resort_ids.iter().any(|id| id == "domain"));
 
     let nearby_plan = plans
         .iter()
@@ -475,7 +474,7 @@ fn source_pack_planner_keeps_hierarchy_local_and_combines_nearby_standalone_reso
 }
 
 #[test]
-fn source_pack_planner_does_not_combine_standalone_resorts_across_cells() -> Result<()> {
+fn source_pack_planner_combines_standalone_resorts_until_the_leaf_is_full() -> Result<()> {
     let mut west = test_resort("west", "West", "resort", None);
     west.center = [10.0, 46.0];
     let mut east = test_resort("east", "East", "resort", None);
@@ -492,8 +491,61 @@ fn source_pack_planner_does_not_combine_standalone_resorts_across_cells() -> Res
     };
 
     let plans = plan_source_packs(&dataset)?;
-    assert_eq!(plans.len(), 2);
-    assert!(plans.iter().all(|plan| plan.resort_ids.len() == 1));
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].resort_ids, vec!["east", "west"]);
+    Ok(())
+}
+
+#[test]
+fn source_pack_planner_splits_an_adaptive_leaf_when_estimate_exceeds_target() -> Result<()> {
+    let payload = "x".repeat(2 * 1024 * 1024);
+    let mut resorts = Vec::new();
+    let mut runs = Vec::new();
+    for index in 0..15 {
+        let id = format!("resort-{index:02}");
+        let mut resort = test_resort(&id, &id, "resort", None);
+        resort.center = [10.0 + index as f64 * 0.01, 46.0];
+        resorts.push(resort);
+        runs.push(FeatureRecord {
+            id: format!("run-{index:02}"),
+            resort_ids: vec![id],
+            properties: Map::from_iter([("payload".to_string(), Value::String(payload.clone()))]),
+            geometry: json!({
+                "type": "LineString",
+                "coordinates": [[10.0, 46.0], [10.01, 46.01]]
+            }),
+        });
+    }
+    let dataset = NormalizedDataset {
+        dataset_version: "2026-09-10".to_string(),
+        generated_at: Utc::now(),
+        resorts,
+        runs,
+        lifts: Vec::new(),
+        spots: Vec::new(),
+        connections: Vec::new(),
+        lift_station_memberships: Vec::new(),
+    };
+
+    let plans = plan_source_packs(&dataset)?;
+    assert!(plans.len() >= 2);
+    for plan in plans {
+        let estimated_bytes = plan
+            .resort_ids
+            .iter()
+            .map(|id| {
+                let resort = dataset
+                    .resorts
+                    .iter()
+                    .find(|resort| &resort.id == id)
+                    .expect("planned resort");
+                estimate_resort_source_bytes(&dataset, resort)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .fold(0_u64, u64::saturating_add);
+        assert!(estimated_bytes <= SOURCE_PACK_TARGET_BYTES);
+    }
     Ok(())
 }
 
@@ -501,7 +553,7 @@ fn source_pack_planner_does_not_combine_standalone_resorts_across_cells() -> Res
 fn source_pack_planner_splits_an_oversized_hierarchy_without_mixing_roots() -> Result<()> {
     let domain = test_resort("domain", "Domain", "domain", None);
     let child = test_resort("child", "Child", "resort", Some("domain"));
-    let payload = "x".repeat(9 * 1024 * 1024);
+    let payload = "x".repeat(15 * 1024 * 1024);
     let feature_properties = Map::from_iter([(String::from("payload"), Value::String(payload))]);
     let dataset = NormalizedDataset {
         dataset_version: "2026-09-10".to_string(),
@@ -1246,11 +1298,13 @@ fn winteregg_station_topology_survives_cross_pack_release_layout() -> Result<()>
             json!({"type": "Point", "coordinates": [7.9664529, 46.6171299]}),
         ),
     ];
+    let payload = "x".repeat(15 * 1024 * 1024);
     let lifts = vec![
         source_feature(
             json!({
                 "id": "01c94a1646c80ab59a94035582af3e2b619ba6ad",
                 "name": "Winteregg",
+                "payload": payload,
                 "skiAreas": [murren_id],
                 "sources": [{"id": "way/150270143", "type": "openstreetmap"}]
             }),
@@ -1624,7 +1678,14 @@ fn build_pipeline_writes_only_canonical_sqlite_output() -> Result<()> {
             .get("packPolicy")
             .and_then(|policy| policy.get("maxCompressedBytes"))
             .and_then(Value::as_u64),
-        Some(8 * 1024 * 1024)
+        Some(12 * 1024 * 1024)
+    );
+    assert_eq!(
+        latest
+            .get("packPolicy")
+            .and_then(|policy| policy.get("partition"))
+            .and_then(Value::as_str),
+        Some("adaptive-quadtree")
     );
 
     let fingerprint_contract = latest
