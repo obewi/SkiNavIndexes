@@ -1,8 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-const DEFAULT_OVERPASS_BASE_URL: &str = "https://overpass-api.de/api/";
-
 #[derive(Parser)]
 #[command(
     version,
@@ -23,8 +21,13 @@ pub(crate) enum Command {
         dataset_version: Option<String>,
         #[arg(long, default_value = "https://tiles.openskimap.org/geojson")]
         source_base_url: String,
-        #[arg(long, default_value = DEFAULT_OVERPASS_BASE_URL)]
-        overpass_base_url: String,
+        #[arg(long, default_value = "config/overpass.json")]
+        overpass_config: PathBuf,
+        #[arg(
+            long,
+            help = "Preferred Overpass endpoint override; configured endpoints remain fallbacks"
+        )]
+        overpass_base_url: Option<String>,
         #[arg(long)]
         skip_connection_enrichment: bool,
         #[arg(long)]
@@ -54,8 +57,13 @@ pub(crate) enum Command {
         dataset_version: Option<String>,
         #[arg(long, default_value = "https://tiles.openskimap.org/geojson")]
         source_base_url: String,
-        #[arg(long, default_value = DEFAULT_OVERPASS_BASE_URL)]
-        overpass_base_url: String,
+        #[arg(long, default_value = "config/overpass.json")]
+        overpass_config: PathBuf,
+        #[arg(
+            long,
+            help = "Preferred Overpass endpoint override; configured endpoints remain fallbacks"
+        )]
+        overpass_base_url: Option<String>,
         #[arg(long)]
         skip_connection_enrichment: bool,
         #[arg(long)]

@@ -20,7 +20,7 @@ Connection features are cached as an enrichment layer at:
 - `data/raw/openskimap/<dataset-version>/connections.geojson`
 - `data/raw/openskimap/<dataset-version>/lift_station_topology.json`
 
-OpenSkiMap GeoJSON is checked first. When OpenSkiMap contains connection features, they are identified by `properties.type = "connection"` and copied into `connections.geojson`. When OpenSkiMap does not yet contain those features, `fetch` uses a narrow Overpass fallback for raw OSM `piste:type=connection` ways and relations. The default Overpass base URL is `https://overpass-api.de/api/`, and requests use the SkiNavIndexes user agent configured in the CLI. Overpass is only used by `fetch`; `build` and `all --skip-fetch` never query the network.
+OpenSkiMap GeoJSON is checked first. When OpenSkiMap contains connection features, they are identified by `properties.type = "connection"` and copied into `connections.geojson`. When OpenSkiMap does not yet contain those features, `fetch` uses a narrow Overpass fallback for raw OSM `piste:type=connection` ways and relations. Overpass settings live in [`config/overpass.json`](config/overpass.json): it lists the endpoint order and controls station batch size, pacing, retries, timeout, and the 120-day cache freshness window. Requests use the SkiNavIndexes user agent configured in the CLI. Overpass is only used by `fetch`; `build` and `all --skip-fetch` never query the network.
 
 Lift-station topology is fetched as a second bounded Overpass enrichment. The query is built only from `node/<id>` and `way/<id>` OSM sources found in `spots.geojson` where `spotType = "lift_station"`; it does not scan the world for stations. The cached `lift_station_topology.json` records station-to-lift memberships and contact coordinates, which are normalized into the source schema v3 `lift_station_memberships` table. Use `--skip-station-topology-enrichment` for an intentional build without this enrichment.
 
@@ -80,7 +80,10 @@ cargo run --release -- build --cache-dir data/raw/openskimap --output-dir output
 # Point at a compatible OpenSkiMap GeoJSON base URL.
 cargo run --release -- fetch --source-base-url https://tiles.openskimap.org/geojson
 
-# Point connection enrichment at a different Overpass API base URL.
+# Use a different Overpass configuration file.
+cargo run --release -- fetch --overpass-config /path/to/overpass.json
+
+# Prefer one endpoint first while retaining configured endpoints as fallbacks.
 cargo run --release -- fetch --overpass-base-url https://overpass-api.de/api/
 ```
 
@@ -141,7 +144,7 @@ The workflow does not use `actions/cache` or `actions/upload-artifact`; generate
 
 The rolling cache contains parsed connection data and per-station topology entries with fetch timestamps. It is an indexer implementation detail, not an app asset; SkiNav downloads only the catalog and source packs.
 
-The persistent cache is stored at `data/raw/openskimap/.overpass/` and is refreshed per station or connection after 120 days. Station topology requests are bounded to batches of 200 station source IDs. The default request order is `overpass-api.de`, `maps.mail.ru`, `private.coffee`, then `overpass.osm.jp`; requests are paced and can use stale cached entries when all affected data is already available.
+The persistent cache is stored at `data/raw/openskimap/.overpass/` and is refreshed per station or connection after 120 days. Station topology requests are bounded to batches of 5,000 station source IDs by the checked-in Overpass configuration. The default request order is `overpass-api.de`, `maps.mail.ru`, `private.coffee`, then `overpass.osm.jp`; requests are paced and can use stale cached entries when all affected data is already available.
 
 The public release contract is the root-level `latest.json`, `catalog.sqlite.gz`, and `pack-*.sqlite.gz` assets. The release tag in `latest.json` is the immutable tag used for the catalog and pack asset URLs; clients do not resolve individual assets through a moving `releases/latest` URL. The publishing workflow refuses to mutate an existing release tag.
 

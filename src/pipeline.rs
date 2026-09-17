@@ -1,4 +1,5 @@
 mod build;
+mod config;
 mod fetch;
 mod geo;
 mod io;
@@ -26,6 +27,7 @@ use std::{
 };
 
 use build::*;
+use config::OverpassConfig;
 use fetch::*;
 use geo::*;
 use io::*;
@@ -42,7 +44,6 @@ const LAYER_FILES: [&str; 4] = [
 ];
 const CONNECTIONS_FILE: &str = "connections.geojson";
 const LIFT_STATION_TOPOLOGY_FILE: &str = "lift_station_topology.json";
-const LIFT_STATION_TOPOLOGY_BATCH_SIZE: usize = 200;
 const CONNECTION_ENDPOINT_MATCH_METERS: f64 = 60.0;
 const CONNECTION_SEGMENT_MATCH_METERS: f64 = 35.0;
 const CONNECTION_SEARCH_PADDING_METERS: f64 = 300.0;
@@ -55,17 +56,22 @@ pub fn run() -> Result<()> {
             cache_dir,
             dataset_version,
             source_base_url,
+            overpass_config,
             overpass_base_url,
             skip_connection_enrichment,
             skip_station_topology_enrichment,
-        } => fetch_sources(
-            &cache_dir,
-            dataset_version,
-            &source_base_url,
-            &overpass_base_url,
-            skip_connection_enrichment,
-            skip_station_topology_enrichment,
-        ),
+        } => {
+            let overpass_config = OverpassConfig::load(&overpass_config)?;
+            fetch_sources_with_config(
+                &cache_dir,
+                dataset_version,
+                &source_base_url,
+                overpass_base_url.as_deref(),
+                &overpass_config,
+                skip_connection_enrichment,
+                skip_station_topology_enrichment,
+            )
+        }
         Command::Build {
             cache_dir,
             output_dir,
@@ -87,17 +93,20 @@ pub fn run() -> Result<()> {
             output_dir,
             dataset_version,
             source_base_url,
+            overpass_config,
             overpass_base_url,
             skip_connection_enrichment,
             skip_station_topology_enrichment,
             skip_fetch,
         } => {
             if !skip_fetch {
-                fetch_sources(
+                let overpass_config = OverpassConfig::load(&overpass_config)?;
+                fetch_sources_with_config(
                     &cache_dir,
                     dataset_version.clone(),
                     &source_base_url,
-                    &overpass_base_url,
+                    overpass_base_url.as_deref(),
+                    &overpass_config,
                     skip_connection_enrichment,
                     skip_station_topology_enrichment,
                 )?;

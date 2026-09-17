@@ -4,12 +4,10 @@ pub(super) const OVERPASS_CACHE_DIRECTORY: &str = ".overpass";
 pub(super) const OVERPASS_STATION_CACHE_FILE: &str = "lift_station_topology_cache.json";
 pub(super) const OVERPASS_CONNECTION_CACHE_FILE: &str = "connections_cache.json";
 const OVERPASS_CACHE_SCHEMA_VERSION: u8 = 1;
+#[cfg(test)]
 const OVERPASS_CACHE_STALE_AFTER_DAYS: i64 = 120;
-const OVERPASS_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
-const OVERPASS_MAX_RETRY_ROUNDS: usize = 2;
-const OVERPASS_RETRY_DELAY: Duration = Duration::from_secs(5);
-const OVERPASS_RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
 const OVERPASS_DEFAULT_ENDPOINT: &str = "https://overpass-api.de/api/interpreter";
+#[cfg(test)]
 const OVERPASS_FALLBACK_ENDPOINTS: [&str; 3] = [
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
@@ -51,11 +49,11 @@ pub(super) struct OverpassPacer {
 }
 
 impl OverpassPacer {
-    fn wait(&mut self, sleep: &mut dyn FnMut(Duration)) {
+    fn wait_with_interval(&mut self, interval: Duration, sleep: &mut dyn FnMut(Duration)) {
         if let Some(last_request) = self.last_request {
             let elapsed = last_request.elapsed();
-            if elapsed < OVERPASS_REQUEST_INTERVAL {
-                sleep(OVERPASS_REQUEST_INTERVAL - elapsed);
+            if elapsed < interval {
+                sleep(interval - elapsed);
             }
         }
         self.last_request = Some(std::time::Instant::now());
@@ -89,6 +87,7 @@ pub(super) fn overpass_interpreter_url(base_url: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub(super) fn overpass_endpoints(preferred_base_url: &str) -> Vec<String> {
     let preferred = overpass_interpreter_url(preferred_base_url);
     let public_endpoints = std::iter::once(OVERPASS_DEFAULT_ENDPOINT)
@@ -112,6 +111,28 @@ pub(super) fn overpass_endpoints(preferred_base_url: &str) -> Vec<String> {
     }
 }
 
+fn overpass_endpoints_with_config(
+    config: &OverpassConfig,
+    preferred_base_url: Option<&str>,
+) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    for endpoint in &config.endpoints {
+        let endpoint = overpass_interpreter_url(endpoint);
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
+
+    if let Some(preferred_base_url) = preferred_base_url {
+        let preferred = overpass_interpreter_url(preferred_base_url);
+        endpoints.retain(|endpoint| endpoint != &preferred);
+        endpoints.insert(0, preferred);
+    }
+
+    endpoints
+}
+
+#[cfg(test)]
 pub(super) fn overpass_request_with_fallback(
     client: &Client,
     preferred_base_url: &str,
@@ -120,14 +141,34 @@ pub(super) fn overpass_request_with_fallback(
     pacer: &mut OverpassPacer,
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<OverpassResponse> {
-    let mut errors = Vec::new();
+    let mut config = OverpassConfig::default();
+    config.endpoints = overpass_endpoints(preferred_base_url);
+    overpass_request_with_fallback_with_config(
+        client, &config, None, query, operation, pacer, sleep,
+    )
+}
 
-    for round in 0..OVERPASS_MAX_RETRY_ROUNDS {
+pub(super) fn overpass_request_with_fallback_with_config(
+    client: &Client,
+    config: &OverpassConfig,
+    preferred_base_url: Option<&str>,
+    query: &str,
+    operation: &str,
+    pacer: &mut OverpassPacer,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<OverpassResponse> {
+    let mut errors = Vec::new();
+    let endpoints = overpass_endpoints_with_config(config, preferred_base_url);
+    if endpoints.is_empty() {
+        bail!("Overpass endpoint configuration is empty");
+    }
+
+    for round in 0..config.max_retry_rounds {
         let mut transient_failure = false;
         let mut rate_limit_delay = None;
 
-        for endpoint in overpass_endpoints(preferred_base_url) {
-            pacer.wait(sleep);
+        for endpoint in endpoints.iter().cloned() {
+            pacer.wait_with_interval(config.request_interval(), sleep);
             eprintln!("Querying Overpass {operation}: {endpoint}");
             let response = match client.post(&endpoint).form(&[("data", query)]).send() {
                 Ok(response) => response,
@@ -160,7 +201,7 @@ pub(super) fn overpass_request_with_fallback(
 
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 transient_failure = true;
-                let delay = overpass_retry_after(&response).unwrap_or(OVERPASS_RATE_LIMIT_DELAY);
+                let delay = overpass_retry_after(&response).unwrap_or(config.rate_limit_delay());
                 rate_limit_delay =
                     Some(rate_limit_delay.map_or(delay, |current: Duration| current.max(delay)));
                 errors.push(format!("{endpoint}: HTTP {status}"));
@@ -180,11 +221,11 @@ pub(super) fn overpass_request_with_fallback(
             errors.push(format!("{endpoint}: HTTP {status}"));
         }
 
-        if !transient_failure || round + 1 == OVERPASS_MAX_RETRY_ROUNDS {
+        if !transient_failure || round + 1 == config.max_retry_rounds {
             break;
         }
 
-        let delay = rate_limit_delay.unwrap_or(OVERPASS_RETRY_DELAY);
+        let delay = rate_limit_delay.unwrap_or(config.retry_delay());
         eprintln!(
             "All Overpass endpoints failed for {operation}; retrying after {} seconds",
             delay.as_secs()
@@ -207,8 +248,17 @@ fn overpass_retry_after(response: &reqwest::blocking::Response) -> Option<Durati
         .map(Duration::from_secs)
 }
 
+#[cfg(test)]
 pub(super) fn overpass_cache_entry_is_fresh(fetched_at: i64, now: i64) -> bool {
-    now.saturating_sub(fetched_at) < OVERPASS_CACHE_STALE_AFTER_DAYS.saturating_mul(24 * 60 * 60)
+    overpass_cache_entry_is_fresh_after_days(fetched_at, now, OVERPASS_CACHE_STALE_AFTER_DAYS)
+}
+
+fn overpass_cache_entry_is_fresh_after_days(
+    fetched_at: i64,
+    now: i64,
+    stale_after_days: i64,
+) -> bool {
+    now.saturating_sub(fetched_at) < stale_after_days.max(0).saturating_mul(24 * 60 * 60)
 }
 
 fn read_station_topology_cache(path: &Path) -> Result<PersistentStationTopologyCache> {
@@ -298,25 +348,31 @@ fn validate_geojson_value(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn file_modified_at(path: &Path) -> i64 {
+fn file_modified_at_with_stale_days(path: &Path, stale_after_days: i64) -> i64 {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or_else(|| {
-            Utc::now().timestamp() - (OVERPASS_CACHE_STALE_AFTER_DAYS + 1) * 24 * 60 * 60
+            Utc::now().timestamp()
+                - stale_after_days
+                    .max(0)
+                    .saturating_add(1)
+                    .saturating_mul(24 * 60 * 60)
         })
 }
 
-pub(super) fn fetch_sources(
+pub(super) fn fetch_sources_with_config(
     cache_dir: &Path,
     dataset_version: Option<String>,
     source_base_url: &str,
-    overpass_base_url: &str,
+    overpass_base_url: Option<&str>,
+    overpass_config: &OverpassConfig,
     skip_connection_enrichment: bool,
     skip_station_topology_enrichment: bool,
 ) -> Result<()> {
+    overpass_config.validate()?;
     let dataset_version =
         dataset_version.unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
     let dataset_dir = cache_dir.join(&dataset_version);
@@ -324,7 +380,7 @@ pub(super) fn fetch_sources(
         .with_context(|| format!("creating source cache {}", dataset_dir.display()))?;
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(overpass_config.request_timeout())
         .user_agent("SkiNavIndexes/0.1 (OpenSkiMap GeoJSON cache)")
         .build()
         .context("building HTTP client")?;
@@ -368,7 +424,12 @@ pub(super) fn fetch_sources(
             "reason": "skip_connection_enrichment"
         })
     } else {
-        fetch_or_extract_connections(&dataset_dir, overpass_base_url, &client)?
+        fetch_or_extract_connections_with_config(
+            &dataset_dir,
+            overpass_base_url,
+            overpass_config,
+            &client,
+        )?
     };
     let station_topology_source = if skip_station_topology_enrichment {
         json!({
@@ -377,7 +438,12 @@ pub(super) fn fetch_sources(
             "reason": "skip_station_topology_enrichment"
         })
     } else {
-        fetch_or_extract_lift_station_topology(&dataset_dir, overpass_base_url, &client)?
+        fetch_or_extract_lift_station_topology_with_config(
+            &dataset_dir,
+            overpass_base_url,
+            overpass_config,
+            &client,
+        )?
     };
 
     let metadata = json!({
@@ -398,9 +464,26 @@ pub(super) struct LiftStationTopologyConversionSummary {
     pub(super) membership_count: usize,
 }
 
+#[cfg(test)]
 pub(super) fn fetch_or_extract_lift_station_topology(
     dataset_dir: &Path,
     overpass_base_url: &str,
+    client: &Client,
+) -> Result<Value> {
+    let mut config = OverpassConfig::default();
+    config.endpoints = overpass_endpoints(overpass_base_url);
+    fetch_or_extract_lift_station_topology_with_config(
+        dataset_dir,
+        Some(overpass_base_url),
+        &config,
+        client,
+    )
+}
+
+pub(super) fn fetch_or_extract_lift_station_topology_with_config(
+    dataset_dir: &Path,
+    overpass_base_url: Option<&str>,
+    overpass_config: &OverpassConfig,
     client: &Client,
 ) -> Result<Value> {
     let target = dataset_dir.join(LIFT_STATION_TOPOLOGY_FILE);
@@ -422,7 +505,8 @@ pub(super) fn fetch_or_extract_lift_station_topology(
     };
 
     if target.exists() {
-        let fetched_at = file_modified_at(&target);
+        let fetched_at =
+            file_modified_at_with_stale_days(&target, overpass_config.cache_stale_after_days);
         for topology in read_lift_station_topology(&target)? {
             let should_replace = cache
                 .stations
@@ -449,33 +533,39 @@ pub(super) fn fetch_or_extract_lift_station_topology(
     let stale_station_count = station_sources
         .iter()
         .filter(|source| {
-            cache
-                .stations
-                .get(*source)
-                .is_some_and(|entry| !overpass_cache_entry_is_fresh(entry.fetched_at, now))
+            cache.stations.get(*source).is_some_and(|entry| {
+                !overpass_cache_entry_is_fresh_after_days(
+                    entry.fetched_at,
+                    now,
+                    overpass_config.cache_stale_after_days,
+                )
+            })
         })
         .count();
     let fresh_station_count = station_sources.len() - missing_station_count - stale_station_count;
     let refresh_sources = station_sources
         .iter()
         .filter(|source| {
-            cache
-                .stations
-                .get(*source)
-                .is_none_or(|entry| !overpass_cache_entry_is_fresh(entry.fetched_at, now))
+            cache.stations.get(*source).is_none_or(|entry| {
+                !overpass_cache_entry_is_fresh_after_days(
+                    entry.fetched_at,
+                    now,
+                    overpass_config.cache_stale_after_days,
+                )
+            })
         })
         .cloned()
         .collect::<Vec<_>>();
 
     let mut pacer = OverpassPacer::default();
     let mut sleep = |duration| std::thread::sleep(duration);
-    let mut preferred_endpoint = overpass_base_url.to_string();
+    let mut preferred_endpoint = overpass_base_url.map(str::to_string);
     let mut query_hashes = Vec::new();
     let mut query_count = 0;
     let mut refreshed_station_count = 0;
     let mut stale_fallback_station_count = 0;
     let mut refresh_blocked = false;
-    for batch in refresh_sources.chunks(LIFT_STATION_TOPOLOGY_BATCH_SIZE) {
+    for batch in refresh_sources.chunks(overpass_config.station_batch_size) {
         if refresh_blocked {
             if batch
                 .iter()
@@ -493,9 +583,10 @@ pub(super) fn fetch_or_extract_lift_station_topology(
         let query = overpass_lift_station_topology_query(batch);
         query_hashes.push(sha256_text(query.as_str()));
         query_count += 1;
-        match overpass_request_with_fallback(
+        match overpass_request_with_fallback_with_config(
             client,
-            &preferred_endpoint,
+            overpass_config,
+            preferred_endpoint.as_deref(),
             &query,
             "station topology",
             &mut pacer,
@@ -522,7 +613,7 @@ pub(super) fn fetch_or_extract_lift_station_topology(
                 }
                 write_station_topology_cache(&cache_path, &cache)?;
                 refreshed_station_count += batch.len();
-                preferred_endpoint = response.endpoint;
+                preferred_endpoint = Some(response.endpoint);
             }
             Err(error) => {
                 if batch
@@ -573,7 +664,11 @@ pub(super) fn fetch_or_extract_lift_station_topology(
     } else {
         "overpass"
     };
-    let metadata_url = (query_count > 0).then(|| overpass_interpreter_url(&preferred_endpoint));
+    let metadata_url = if query_count > 0 {
+        preferred_endpoint.as_deref().map(overpass_interpreter_url)
+    } else {
+        None
+    };
     let url = metadata_url
         .clone()
         .map(Value::String)
@@ -816,9 +911,10 @@ fn overpass_way_node_sources(object: &Map<String, Value>) -> Vec<String> {
         .map(|id| format!("node/{id}"))
         .collect()
 }
-pub(super) fn fetch_or_extract_connections(
+pub(super) fn fetch_or_extract_connections_with_config(
     dataset_dir: &Path,
-    overpass_base_url: &str,
+    overpass_base_url: Option<&str>,
+    overpass_config: &OverpassConfig,
     client: &Client,
 ) -> Result<Value> {
     let target = dataset_dir.join(CONNECTIONS_FILE);
@@ -860,7 +956,11 @@ pub(super) fn fetch_or_extract_connections(
     };
     let now = Utc::now().timestamp();
     if let Some((fetched_at, connections)) = &persistent_cache {
-        if overpass_cache_entry_is_fresh(*fetched_at, now) {
+        if overpass_cache_entry_is_fresh_after_days(
+            *fetched_at,
+            now,
+            overpass_config.cache_stale_after_days,
+        ) {
             write_json_atomically(&target, connections)?;
             let metadata = file_metadata(CONNECTIONS_FILE, &target, None)?;
             return Ok(json!({
@@ -877,8 +977,9 @@ pub(super) fn fetch_or_extract_connections(
     let query = overpass_connection_query();
     let mut pacer = OverpassPacer::default();
     let mut sleep = |duration| std::thread::sleep(duration);
-    let response = match overpass_request_with_fallback(
+    let response = match overpass_request_with_fallback_with_config(
         client,
+        overpass_config,
         overpass_base_url,
         &query,
         "connection enrichment",

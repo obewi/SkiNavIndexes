@@ -1,0 +1,15 @@
+{
+  "endpoints": [
+    "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.osm.jp/api/interpreter"
+  ],
+  "stationBatchSize": 5000,
+  "requestIntervalSeconds": 2,
+  "maxRetryRounds": 2,
+  "retryDelaySeconds": 5,
+  "rateLimitDelaySeconds": 30,
+  "requestTimeoutSeconds": 600,
+  "cacheStaleAfterDays": 120
+}
